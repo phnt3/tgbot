@@ -527,6 +527,43 @@ async def handle_upload(message: types.Message) -> None:
         await message.answer("File is too large after download.")
         return
 
+    # A settings backup is only imported when the user armed "Import
+    # settings" from the settings screen; every other JSON file is stored in
+    # the uploads folder like any other document.
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    if (
+        document is not None
+        and filename.lower().endswith(".json")
+        and chat_id is not None
+    ):
+        from handlers import settings_ui
+
+        if settings_ui.import_armed(int(chat_id)):
+            try:
+                imported = await asyncio.to_thread(
+                    settings_ui.import_settings, int(chat_id), payload
+                )
+            except ValueError as e:
+                await message.answer(f"Import failed: {e}")
+                return
+            except Exception:
+                logger.exception("Settings import failed")
+                await message.answer("Import failed: unexpected error.")
+                return
+
+            labels = {
+                "applications": "applications",
+                "profiles": "profiles",
+                "alerts": "monitoring alerts",
+                "notifications": "notifications",
+            }
+            names = [labels.get(key, key) for key in imported]
+            await message.answer(
+                "Settings imported: " + (", ".join(names) if names else "nothing") + "."
+            )
+            return
+
     try:
         saved = await asyncio.to_thread(
             save_upload, filename, payload, default_upload_dir()

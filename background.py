@@ -20,6 +20,7 @@ from aiogram import Bot
 from alerts import AlertManager, load_alert_settings
 from database import Database
 from monitor import get_all_metrics
+from notifier import load_notification_settings, quiet_hours_active
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,9 @@ class BackgroundMonitor:
             cooldowns=settings["cooldowns"],
         )
         self.user_ids = [int(uid) for uid in (user_ids or [])]
+        # An explicit interval is pinned (tests/custom callers); otherwise the
+        # value follows the stored settings and is refreshed on every cycle.
+        self._interval_pinned = interval_seconds is not None
         self.interval_seconds = int(
             interval_seconds
             if interval_seconds is not None
@@ -83,6 +87,22 @@ class BackgroundMonitor:
         self.history_rows = int(history_rows)
         self._task: Optional[asyncio.Task] = None
         self._cycles = 0
+
+    def reload_settings(self) -> None:
+        """Apply alert settings edited in the bot, without a restart.
+
+        Failures are logged and the current values are kept, so a broken
+        settings row can never stop monitoring.
+        """
+        try:
+            settings = load_alert_settings()
+            self.alert_manager.update_settings(
+                settings["thresholds"], settings["cooldowns"]
+            )
+            if not self._interval_pinned:
+                self.interval_seconds = max(1, int(settings["interval_seconds"]))
+        except Exception as e:  # pragma: no cover - defensive
+            logger.error("Failed to reload alert settings: %s", e)
 
     # -- lifecycle ------------------------------------------------------
 
@@ -122,6 +142,7 @@ class BackgroundMonitor:
         try:
             while True:
                 try:
+                    self.reload_settings()
                     await self.run_once()
                 except asyncio.CancelledError:
                     raise
@@ -242,6 +263,14 @@ class BackgroundMonitor:
             alert: Alert dict returned by the alert manager.
         """
         text = self.format_alert(alert)
+        level = str(alert.get("level", "info")).strip().lower()
+        if level != "critical":
+            try:
+                if quiet_hours_active(load_notification_settings()):
+                    logger.debug("Suppressed %s alert during quiet hours", level)
+                    return
+            except Exception as e:  # pragma: no cover - defensive
+                logger.debug("Quiet-hours check failed: %s", e)
         for user_id in self.user_ids:
             try:
                 await self.bot.send_message(user_id, text)

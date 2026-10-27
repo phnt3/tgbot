@@ -51,11 +51,24 @@ async def main() -> None:
     logger = logging.getLogger(__name__)
     logger.info("Starting PC Remote bot...")
 
+    # Settings live in the bot database; fill any missing section from the
+    # config folder once, at startup, before anything reads them.
+    db_path = config["DATA_DIR"] / "pc_remote.db"
+    from settings_store import ensure_defaults
+
+    try:
+        created = ensure_defaults(db_path)
+        if created:
+            logger.info(
+                "Seeded settings sections: %s", ", ".join(sorted(created))
+            )
+    except Exception as e:
+        logger.error(f"Failed to seed settings: {e}")
+
     background = None
     scheduler = None
 
     # Initialize database
-    db_path = config["DATA_DIR"] / "pc_remote.db"
     try:
         db = Database(db_path)
         logger.info("Database initialized successfully")
@@ -94,6 +107,14 @@ async def main() -> None:
         @dispatcher.message(F.document | F.photo)
         async def upload_handler(message: types.Message) -> None:
             await features.handle_upload(message)
+
+        # Free-text answers to settings prompts. Registered last so commands
+        # and uploads keep priority; harmless when nothing is pending.
+        from handlers import settings_ui
+
+        @dispatcher.message(F.text & ~F.text.startswith("/"))
+        async def settings_text_handler(message: types.Message) -> None:
+            await settings_ui.handle_text(message)
 
         # Periodic sampling: writes history and pushes threshold alerts.
         from background import BackgroundMonitor

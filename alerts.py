@@ -84,37 +84,37 @@ def _positive_float(value: Any) -> Optional[float]:
     return number
 
 
-def load_alert_settings(path: Optional[Path] = None) -> Dict[str, Any]:
-    """Load alert settings, merging an optional JSON file over the defaults.
+def _non_negative_float(value: Any) -> Optional[float]:
+    """Return ``value`` as a zero-or-greater float, or None when invalid.
+
+    A cooldown of 0 is valid: it means "alert on every check" instead of
+    being silently replaced by the default.  ``inf`` is also accepted because
+    older settings snapshots stored "never repeat" that way.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(number) or number < 0:
+        return None
+    return number
+
+
+def normalize_alert_settings(raw: Any) -> Dict[str, Any]:
+    """Merge a raw mapping over the defaults, ignoring invalid values.
 
     Unknown keys and invalid values are ignored instead of crashing the bot,
-    so a mistyped config can never disable monitoring. A cooldown of ``null``
+    so a mistyped setting can never disable monitoring. A cooldown of ``None``
     is valid and means "never repeat while the breach stays active".
-
-    Args:
-        path: Optional path to a JSON settings file.
-
-    Returns:
-        Dict with "thresholds", "cooldowns" and "interval_seconds".
     """
     settings: Dict[str, Any] = {
         "thresholds": dict(DEFAULT_THRESHOLDS),
         "cooldowns": dict(DEFAULT_COOLDOWNS),
         "interval_seconds": DEFAULT_INTERVAL_SECONDS,
     }
-
-    config_path = Path(path) if path is not None else ALERT_CONFIG_PATH
-    if not config_path.is_file():
-        return settings
-
-    try:
-        raw = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as e:
-        logger.warning("Ignoring invalid alert config %s: %s", config_path, e)
-        return settings
-
     if not isinstance(raw, dict):
-        logger.warning("Ignoring alert config %s: top level must be an object", config_path)
+        if raw is not None:
+            logger.warning("Ignoring alert settings: top level must be an object")
         return settings
 
     for section in ("thresholds", "cooldowns"):
@@ -128,8 +128,17 @@ def load_alert_settings(path: Optional[Path] = None) -> Dict[str, Any]:
                 # null = alert once per breach, never repeat while it lasts.
                 settings[section][key] = math.inf
                 continue
+            if section == "cooldowns":
+                number = _non_negative_float(value)
+                if number is None:
+                    logger.warning(
+                        "Ignoring invalid %s value for %s: %r", section, key, value
+                    )
+                    continue
+                settings[section][key] = number
+                continue
             number = _positive_float(value)
-            if number is None:
+            if number is None or not math.isfinite(number):
                 logger.warning("Ignoring invalid %s value for %s: %r", section, key, value)
                 continue
             settings[section][key] = number
@@ -141,6 +150,97 @@ def load_alert_settings(path: Optional[Path] = None) -> Dict[str, Any]:
         )
 
     return settings
+
+
+def _read_alerts_file() -> Optional[Dict[str, Any]]:
+    """Read config/alerts.json, or None when it is missing or invalid."""
+    if not ALERT_CONFIG_PATH.is_file():
+        return None
+    try:
+        raw = json.loads(ALERT_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        logger.warning("Ignoring invalid alert config %s: %s", ALERT_CONFIG_PATH, e)
+        return None
+    if not isinstance(raw, dict):
+        logger.warning(
+            "Ignoring alert config %s: top level must be an object", ALERT_CONFIG_PATH
+        )
+        return None
+    return raw
+
+
+def load_alert_settings(path: Optional[Path] = None) -> Dict[str, Any]:
+    """Load monitoring threshold settings.
+
+    Args:
+        path: Optional explicit JSON file (tests). When omitted the database
+            setting is used, seeded at startup from config/alerts.json.
+
+    Returns:
+        Dict with "thresholds", "cooldowns" and "interval_seconds".
+    """
+    if path is not None:
+        config_path = Path(path)
+        if not config_path.is_file():
+            return normalize_alert_settings({})
+        try:
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            logger.warning("Ignoring invalid alert config %s: %s", config_path, e)
+            return normalize_alert_settings({})
+        return normalize_alert_settings(raw)
+
+    try:
+        from settings_store import ALERTS, MISSING, get_setting
+
+        stored = get_setting(ALERTS, MISSING)
+    except Exception:  # pragma: no cover - database unavailable
+        stored = MISSING
+    if stored is not MISSING:
+        return normalize_alert_settings(stored)
+    return normalize_alert_settings(_read_alerts_file())
+
+
+def seed_alert_settings() -> Dict[str, Any]:
+    """Build the first-run alert settings from config/alerts.json.
+
+    ``math.inf`` ("never repeat") is stored as JSON ``null`` so the seeded
+    snapshot stays portable strict JSON.
+    """
+    settings = normalize_alert_settings(_read_alerts_file())
+    settings["cooldowns"] = {
+        key: (None if value == math.inf else value)
+        for key, value in settings["cooldowns"].items()
+    }
+    return settings
+
+
+def save_alert_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate and store alert settings in the bot database.
+
+    ``math.inf`` cooldowns are stored as JSON ``null`` ("never repeat").
+
+    Returns:
+        The normalized settings that were stored.
+    """
+    normalized = normalize_alert_settings(settings)
+    payload = {
+        "thresholds": {
+            key: float(value)
+            for key, value in normalized["thresholds"].items()
+            if math.isfinite(float(value))
+        },
+        "cooldowns": {
+            key: (None if math.isinf(float(value)) else float(value))
+            for key, value in normalized["cooldowns"].items()
+        },
+        "interval_seconds": int(normalized["interval_seconds"]),
+    }
+
+    from settings_store import ALERTS, set_setting
+
+    set_setting(ALERTS, payload)
+    return normalized
 
 
 class AlertManager:
@@ -180,6 +280,21 @@ class AlertManager:
         # Breach state is restored from the database once, so a restart does
         # not re-send alerts for problems that are still active.
         self._seeded = False
+
+    def update_settings(
+        self,
+        thresholds: Optional[Dict[str, float]] = None,
+        cooldowns: Optional[Dict[str, float]] = None,
+    ) -> None:
+        """Apply new thresholds/cooldowns without resetting breach state."""
+        if thresholds:
+            self.thresholds.update(
+                {k: v for k, v in thresholds.items() if k in DEFAULT_THRESHOLDS}
+            )
+        if cooldowns:
+            self.cooldowns.update(
+                {k: v for k, v in cooldowns.items() if k in DEFAULT_COOLDOWNS}
+            )
 
     # -- public API -----------------------------------------------------
 

@@ -92,6 +92,8 @@ def test_load_applications_falls_back_to_example(tmp_path, monkeypatch):
         am, "DEFAULT_APPLICATIONS_CONFIG", tmp_path / "does-not-exist.json"
     )
     monkeypatch.setattr(am, "FALLBACK_APPLICATIONS_CONFIG", fallback)
+    # Keep the test away from the live database.
+    monkeypatch.setattr(am, "_stored_applications", lambda: None)
 
     assert am.load_applications_config() == {
         "ExampleApp": r"C:\Apps\example.exe"

@@ -138,8 +138,9 @@ async def show_help(message: types.Message) -> None:
         "- Media & Volume: volume, mute and media transport keys\n"
         "- Network / VPN: active interfaces, Wi-Fi and VPN status\n"
         "- Scheduled Tasks: timed shutdown, restart, sleep, lock or profile launch\n"
-        "- Settings: bot configuration info\n\n"
+        "- Settings: change notifications, alerts, applications, profiles and backups\n\n"
         "Send a document or photo to the bot to save it in data/uploads.\n"
+        "A settings backup is imported only from Settings -> Backup & restore.\n"
         "All actions require authorization. Only configured users can control this bot."
     )
     try:

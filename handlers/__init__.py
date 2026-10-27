@@ -98,9 +98,15 @@ def register_init_callbacks(dispatcher: Dispatcher) -> None:
             from handlers import features
 
             await features.handle_callback(callback, data)
+        elif data.startswith("set_"):
+            # In-bot settings screens live in handlers/settings_ui.py
+            from handlers import settings_ui
+
+            await settings_ui.handle_callback(callback, data)
         elif data.startswith(("menu_", "profile_")):
             # Route to menu and profile handlers
             from handlers import features
+            from handlers import settings_ui
 
             routing = {
                 "menu_main": lambda msg: show_main_menu_handler(msg),
@@ -111,7 +117,7 @@ def register_init_callbacks(dispatcher: Dispatcher) -> None:
                 "menu_screenshot": lambda msg: take_screenshot(msg),
                 "menu_processes": lambda msg: show_process_info(msg),
                 "menu_alerts": lambda msg: show_alerts_history(msg),
-                "menu_settings": lambda msg: show_settings(msg),
+                "menu_settings": lambda msg: settings_ui.show_settings(msg),
                 "menu_disk": lambda msg: features.show_disk_menu(msg),
                 "menu_files": lambda msg: features.show_files(msg),
                 "menu_media": lambda msg: features.show_media_menu(msg),
@@ -859,25 +865,6 @@ async def show_alerts_history(message: types.Message) -> None:
 
     lines.append("")
     lines.append(f"Total shown: {len(alerts)}")
-
-    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text="<< Back", callback_data="menu_main")],
-    ])
-
-    await message.answer("\n".join(lines), reply_markup=keyboard, disable_web_page_preview=True)
-
-
-async def show_settings(message: types.Message) -> None:
-    """Show settings screen."""
-    from config import config
-
-    lines = ["=== SETTINGS ===", ""]
-    lines.append("Bot configuration:")
-    lines.append(f"Authorized users: {len(config['ALLOWED_USER_IDS'])}")
-    lines.append("Bot token: configured")
-    lines.append("")
-    lines.append("Full settings are in the .env file.")
-    lines.append("Restart the bot after changing configuration.")
 
     keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
         [types.InlineKeyboardButton(text="<< Back", callback_data="menu_main")],

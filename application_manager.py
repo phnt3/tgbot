@@ -32,19 +32,57 @@ DEFAULT_APPLICATIONS_CONFIG = CONFIG_DIR / "applications.json"
 FALLBACK_APPLICATIONS_CONFIG = CONFIG_DIR / "applications.example.json"
 
 
+def _clean_applications(raw: Any) -> Dict[str, str]:
+    """Validate a raw name -> path mapping, dropping unsafe entries."""
+    valid: Dict[str, str] = {}
+    if not isinstance(raw, dict):
+        logger.warning("Application settings must be an object, got %s", type(raw).__name__)
+        return valid
+    for name, path in raw.items():
+        name = str(name or "").strip()
+        path = str(path or "").strip()
+        if validate_application_name(name) and validate_path_safe(path):
+            valid[name] = path
+        else:
+            logger.warning(
+                "Skipping invalid application config: name=%r path=%r", name, path
+            )
+    return valid
+
+
+def _stored_applications() -> Optional[Dict[str, str]]:
+    """Return the database-backed allowlist, or None when it is missing.
+
+    ``None`` means "not configured yet": startup seeding has not run, so the
+    JSON config file is still authoritative.
+    """
+    try:
+        from settings_store import APPLICATIONS, MISSING, get_setting
+
+        stored = get_setting(APPLICATIONS, MISSING)
+    except Exception as e:  # pragma: no cover - database unavailable
+        logger.warning("Could not read applications from settings: %s", e)
+        return None
+    if stored is MISSING:
+        return None
+    return _clean_applications(stored)
+
+
 def load_applications_config(config_path: Optional[Path] = None) -> Dict[str, str]:
-    """Load application allowlist from JSON configuration file.
+    """Load application allowlist.
 
     Args:
-        config_path: Path to the applications JSON config file.
-                     Defaults to config/applications.json, falling back to
-                     config/applications.example.json when the user config
-                     does not exist yet.
+        config_path: Explicit JSON file used for tests and seeding. When it is
+            None the database setting is preferred, falling back to
+            config/applications.json and then the bundled example.
 
     Returns:
         Dictionary mapping application names to executable paths.
     """
     if config_path is None:
+        stored = _stored_applications()
+        if stored is not None:
+            return stored
         config_path = DEFAULT_APPLICATIONS_CONFIG
         if not config_path.exists():
             config_path = FALLBACK_APPLICATIONS_CONFIG
@@ -56,18 +94,7 @@ def load_applications_config(config_path: Optional[Path] = None) -> Dict[str, st
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             config_data = json.load(f)
-
-        # Validate and filter entries
-        valid_apps = {}
-        for name, path in config_data.items():
-            if validate_application_name(name) and validate_path_safe(path):
-                valid_apps[name] = path
-            else:
-                logger.warning(
-                    f"Skipping invalid application config: name='{name}', path='{path}'"
-                )
-
-        return valid_apps
+        return _clean_applications(config_data)
 
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse applications config: {e}")
@@ -75,6 +102,82 @@ def load_applications_config(config_path: Optional[Path] = None) -> Dict[str, st
     except Exception as e:
         logger.error(f"Unexpected error loading applications config: {e}")
         return {}
+
+
+def seed_applications() -> Dict[str, str]:
+    """Read the allowlist from the JSON files, for first-run seeding.
+
+    Never reads the database, so it is safe to call from startup and tests.
+    """
+    for candidate in (DEFAULT_APPLICATIONS_CONFIG, FALLBACK_APPLICATIONS_CONFIG):
+        if candidate.is_file():
+            return load_applications_config(candidate)
+    return {}
+
+
+def save_applications_config(applications: Dict[str, str]) -> Dict[str, str]:
+    """Validate and store the allowlist in the bot database.
+
+    Raises:
+        ValueError: when a name or path is unsafe; nothing is written.
+    """
+    cleaned: Dict[str, str] = {}
+    for raw_name, raw_path in (applications or {}).items():
+        name = str(raw_name or "").strip()
+        path = str(raw_path or "").strip()
+        if not validate_application_name(name):
+            raise ValueError(f"Invalid application name: {name!r}")
+        if not validate_path_safe(path):
+            raise ValueError(f"Unsafe executable path for {name!r}")
+        cleaned[name] = path
+
+    from settings_store import APPLICATIONS, set_setting
+
+    set_setting(APPLICATIONS, cleaned)
+    return cleaned
+
+
+def add_application(name: str, path: str, replace: bool = False) -> Dict[str, str]:
+    """Add one application to the allowlist.
+
+    Raises:
+        ValueError: on an invalid entry or a duplicate name (unless ``replace``).
+    """
+    name = str(name or "").strip()
+    path = str(path or "").strip()
+    if not validate_application_name(name):
+        raise ValueError(f"Invalid application name: {name!r}")
+    if not validate_path_safe(path):
+        raise ValueError("That path contains unsupported characters.")
+
+    current = load_applications_config()
+    for existing in current:
+        if existing == name:
+            if not replace:
+                raise ValueError(f"{existing!r} is already configured.")
+        elif existing.casefold() == name.casefold():
+            raise ValueError(
+                f"{existing!r} already exists; names must be unique (case-insensitive)."
+            )
+    current[name] = path
+    return save_applications_config(current)
+
+
+def remove_application(name: str) -> bool:
+    """Remove one application from the allowlist.
+
+    Returns:
+        True when the entry existed and was removed.
+    """
+    current = load_applications_config()
+    if name not in current:
+        return False
+    del current[name]
+    save_applications_config(current)
+
+    # Profiles referencing the removed key are left untouched: launch_profile
+    # reports such keys as failed instead of silently changing the profile.
+    return True
 
 
 def find_application_path(

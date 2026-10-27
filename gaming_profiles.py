@@ -26,18 +26,60 @@ PROFILES_CONFIG_PATH = CONFIG_DIR / "profiles.json"
 PROFILES_EXAMPLE_PATH = CONFIG_DIR / "profiles.example.json"
 
 
-def load_profiles_config(path: Optional[Path] = None) -> Dict[str, Dict[str, Any]]:
-    """Load gaming profiles from JSON configuration.
+def _clean_profiles(raw: Any) -> Dict[str, Dict[str, Any]]:
+    """Normalize a raw profile mapping, dropping malformed entries."""
+    profiles: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(raw, dict):
+        logger.warning("Profiles settings must be an object, got %s", type(raw).__name__)
+        return profiles
+    for name, spec in raw.items():
+        name = str(name or "").strip()
+        if not name or not isinstance(spec, dict):
+            logger.warning("Skipping malformed profile entry: %s", name)
+            continue
+        apps = spec.get("apps") or []
+        optional = spec.get("optional") or []
+        if not isinstance(apps, list) or not isinstance(optional, list):
+            logger.warning("Skipping profile %s: apps must be lists", name)
+            continue
+        profiles[name] = {
+            "description": str(spec.get("description", "")),
+            "apps": [str(a) for a in apps],
+            "optional": [str(a) for a in optional],
+        }
+    return profiles
 
-    Falls back to the bundled example when no user config exists, so the bot
-    works out of the box and the user can later edit profiles.json.
+
+def _stored_profiles() -> Optional[Dict[str, Dict[str, Any]]]:
+    """Return the database-backed profiles, or None when not configured yet."""
+    try:
+        from settings_store import MISSING, PROFILES, get_setting
+
+        stored = get_setting(PROFILES, MISSING)
+    except Exception as e:  # pragma: no cover - database unavailable
+        logger.warning("Could not read profiles from settings: %s", e)
+        return None
+    if stored is MISSING:
+        return None
+    return _clean_profiles(stored)
+
+
+def load_profiles_config(path: Optional[Path] = None) -> Dict[str, Dict[str, Any]]:
+    """Load gaming profiles.
 
     Args:
-        path: Optional explicit path used for tests.
+        path: Optional explicit JSON file used for tests and seeding. When it
+            is None the database setting is preferred, falling back to
+            config/profiles.json and then the bundled example.
 
     Returns:
         Mapping of profile name -> profile definition.
     """
+    if path is None:
+        stored = _stored_profiles()
+        if stored is not None:
+            return stored
+
     target = path if path is not None else PROFILES_CONFIG_PATH
     if not target.exists():
         logger.info("profiles.json not found, using bundled example profiles")
@@ -50,17 +92,49 @@ def load_profiles_config(path: Optional[Path] = None) -> Dict[str, Dict[str, Any
         logger.error("Failed to load profiles config: %s", e)
         return {}
 
-    profiles: Dict[str, Dict[str, Any]] = {}
-    for name, spec in raw.items():
+    return _clean_profiles(raw)
+
+
+def seed_profiles() -> Dict[str, Dict[str, Any]]:
+    """Read profiles from the JSON files, for first-run seeding."""
+    for candidate in (PROFILES_CONFIG_PATH, PROFILES_EXAMPLE_PATH):
+        if candidate.is_file():
+            return load_profiles_config(candidate)
+    return {}
+
+
+def save_profiles_config(profiles: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Validate and store profiles in the bot database.
+
+    Raises:
+        ValueError: when a profile name or app key is invalid.
+    """
+    from security import validate_application_name
+
+    cleaned: Dict[str, Dict[str, Any]] = {}
+    for raw_name, spec in (profiles or {}).items():
+        name = str(raw_name or "").strip()
+        if not validate_application_name(name):
+            raise ValueError(f"Invalid profile name: {name!r}")
         if not isinstance(spec, dict):
-            logger.warning("Skipping malformed profile entry: %s", name)
-            continue
-        profiles[name] = {
+            raise ValueError(f"Profile {name!r} must be an object")
+        apps = spec.get("apps") or []
+        optional = spec.get("optional") or []
+        if not isinstance(apps, list) or not isinstance(optional, list):
+            raise ValueError(f"Profile {name!r} app lists must be arrays")
+        for key in list(apps) + list(optional):
+            if not validate_application_name(str(key)):
+                raise ValueError(f"Profile {name!r} has an invalid app key: {key!r}")
+        cleaned[name] = {
             "description": str(spec.get("description", "")),
-            "apps": [str(a) for a in spec.get("apps", [])],
-            "optional": [str(a) for a in spec.get("optional", [])],
+            "apps": [str(a) for a in apps],
+            "optional": [str(a) for a in optional],
         }
-    return profiles
+
+    from settings_store import PROFILES, set_setting
+
+    set_setting(PROFILES, cleaned)
+    return cleaned
 
 
 def get_profile(profile_key: str) -> Optional[Dict[str, Any]]:

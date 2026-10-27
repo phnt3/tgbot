@@ -118,6 +118,12 @@ class Database:
                 timestamp REAL NOT NULL,
                 processes_json TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            );
         """)
         self._conn.commit()
 
