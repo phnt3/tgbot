@@ -27,6 +27,10 @@ data/
 *.log
 .pytest_cache/
 
+# Local user configuration (may contain personal app/game lists and paths)
+config/applications.json
+config/profiles.json
+
 # Logs
 logs/
 

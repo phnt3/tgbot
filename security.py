@@ -134,8 +134,9 @@ def validate_path_safe(path_str: str) -> bool:
         if re.search(pattern, path_str):
             return False
     # Check that it looks like a valid path (letters, digits, separators)
-    # Whitespace and parentheses allowed: Windows paths like "Program Files (x86)"
+    # Whitespace, parentheses and square brackets are allowed: Windows paths
+    # like "Program Files (x86)" and "Example Game [Build 1]".
     # Colon allowed for drive letters: "C:\..."
-    if not re.match(r"^[a-zA-Z0-9\\/.\-_:()+\s]+$", path_str):
+    if not re.match(r"^[a-zA-Z0-9\\/.\-_:()+\s\[\]]+$", path_str):
         return False
     return True

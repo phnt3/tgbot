@@ -49,6 +49,7 @@ def test_load_applications_filters_invalid_entries(tmp_path):
         {
             "GoodApp": r"C:\Apps\good.exe",
             "Visual Studio Code": r"C:\Program Files\Microsoft VS Code\Code.exe",
+            "Bracket Game": r"Q:\Games\Example [Build 1]\game.exe",
             "Bad;Name": r"C:\Apps\bad.exe",
             "Traversal": r"C:\Apps\..\evil.exe",
             "Shell": r"C:\Apps\app.exe & calc",
@@ -60,6 +61,7 @@ def test_load_applications_filters_invalid_entries(tmp_path):
     assert loaded == {
         "GoodApp": r"C:\Apps\good.exe",
         "Visual Studio Code": r"C:\Program Files\Microsoft VS Code\Code.exe",
+        "Bracket Game": r"Q:\Games\Example [Build 1]\game.exe",
     }
 
 

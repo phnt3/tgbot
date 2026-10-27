@@ -95,6 +95,7 @@ def test_application_name_rejects_injection_patterns(name):
         r"C:\Apps\app.lnk",
         r"\\server\share\app.exe",
         "/usr/local/bin/app",
+        r"Q:\Games\Example [Build 1]\game.exe",
     ],
 )
 def test_path_safe_accepts_normal_paths(path):
