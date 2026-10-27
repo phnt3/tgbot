@@ -93,8 +93,15 @@ def register_init_callbacks(dispatcher: Dispatcher) -> None:
             await handle_power_confirmation(callback, data)
         elif data.startswith("chart_"):
             await show_chart(callback.message, data[len("chart_"):])
+        elif data.startswith(("dsk_", "fm_", "med_", "net_", "sch_")):
+            # Feature screens live in handlers/features.py
+            from handlers import features
+
+            await features.handle_callback(callback, data)
         elif data.startswith(("menu_", "profile_")):
             # Route to menu and profile handlers
+            from handlers import features
+
             routing = {
                 "menu_main": lambda msg: show_main_menu_handler(msg),
                 "menu_system": lambda msg: show_system_monitoring(msg),
@@ -105,6 +112,11 @@ def register_init_callbacks(dispatcher: Dispatcher) -> None:
                 "menu_processes": lambda msg: show_process_info(msg),
                 "menu_alerts": lambda msg: show_alerts_history(msg),
                 "menu_settings": lambda msg: show_settings(msg),
+                "menu_disk": lambda msg: features.show_disk_menu(msg),
+                "menu_files": lambda msg: features.show_files(msg),
+                "menu_media": lambda msg: features.show_media_menu(msg),
+                "menu_network": lambda msg: features.show_network(msg),
+                "menu_scheduler": lambda msg: features.show_scheduler(msg),
                 "profile_gaming": lambda msg: launch_profile_callback(msg, "GAMING"),
                 "profile_vr": lambda msg: launch_profile_callback(msg, "VR"),
                 "profile_work": lambda msg: launch_profile_callback(msg, "WORK"),

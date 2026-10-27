@@ -8,7 +8,7 @@ import logging
 import sys
 from pathlib import Path
 
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 
 from config import config, load_config
@@ -51,6 +51,9 @@ async def main() -> None:
     logger = logging.getLogger(__name__)
     logger.info("Starting PC Remote bot...")
 
+    background = None
+    scheduler = None
+
     # Initialize database
     db_path = config["DATA_DIR"] / "pc_remote.db"
     try:
@@ -84,17 +87,41 @@ async def main() -> None:
         register_init_callbacks(dispatcher)
         register_common_callbacks(dispatcher)
 
+        # Save documents and photos sent to the bot (authorization enforced
+        # inside the handler).
+        from handlers import features
+
+        @dispatcher.message(F.document | F.photo)
+        async def upload_handler(message: types.Message) -> None:
+            await features.handle_upload(message)
+
         # Periodic sampling: writes history and pushes threshold alerts.
         from background import BackgroundMonitor
+        from notifier import Notifier
+        from scheduler import TaskScheduler
 
+        notifier = Notifier()
         background = BackgroundMonitor(
-            bot, db, user_ids=config["ALLOWED_USER_IDS"]
+            bot,
+            db,
+            user_ids=config["ALLOWED_USER_IDS"],
+            notifier=notifier,
         )
         background.start()
         logger.info(
             "Background monitor scheduled (interval=%ss)",
             background.interval_seconds,
         )
+
+        # Timed shutdown/restart/sleep/lock/profile tasks.
+        scheduler = TaskScheduler(
+            config["DATA_DIR"] / "scheduled_tasks.json",
+            bot=bot,
+            user_ids=config["ALLOWED_USER_IDS"],
+            db=db,
+        )
+        features.set_scheduler(scheduler)
+        scheduler.start()
 
     except Exception as e:
         logger.error(f"Failed to create bot: {e}")
@@ -105,10 +132,16 @@ async def main() -> None:
     try:
         await dispatcher.start_polling(bot, skip_updates=True)
     finally:
-        try:
-            await background.stop()
-        except Exception as e:
-            logger.error(f"Failed to stop background monitor: {e}")
+        if scheduler is not None:
+            try:
+                await scheduler.stop()
+            except Exception as e:
+                logger.error(f"Failed to stop scheduler: {e}")
+        if background is not None:
+            try:
+                await background.stop()
+            except Exception as e:
+                logger.error(f"Failed to stop background monitor: {e}")
         try:
             await bot.session.close()
         except Exception:

@@ -75,6 +75,32 @@ async def show_main_menu(message: types.Message) -> None:
         ],
         [
             types.InlineKeyboardButton(
+                text="Files",
+                callback_data="menu_files"
+            ),
+            types.InlineKeyboardButton(
+                text="Disk Space",
+                callback_data="menu_disk"
+            ),
+        ],
+        [
+            types.InlineKeyboardButton(
+                text="Media & Volume",
+                callback_data="menu_media"
+            ),
+            types.InlineKeyboardButton(
+                text="Network / VPN",
+                callback_data="menu_network"
+            ),
+        ],
+        [
+            types.InlineKeyboardButton(
+                text="Scheduled Tasks",
+                callback_data="menu_scheduler"
+            ),
+        ],
+        [
+            types.InlineKeyboardButton(
                 text="Settings",
                 callback_data="menu_settings"
             ),
@@ -107,7 +133,13 @@ async def show_help(message: types.Message) -> None:
         "- Running Processes: view top processes\n"
         "- Alerts & History: view alerts and monitoring history\n"
         "- Charts: CPU/GPU/RAM/disk history graphs (5m, 1h, 24h)\n"
+        "- Files: browse folders, download files, and upload files to the PC\n"
+        "- Disk Space: disk usage, temp/cache analysis and cleanup\n"
+        "- Media & Volume: volume, mute and media transport keys\n"
+        "- Network / VPN: active interfaces, Wi-Fi and VPN status\n"
+        "- Scheduled Tasks: timed shutdown, restart, sleep, lock or profile launch\n"
         "- Settings: bot configuration info\n\n"
+        "Send a document or photo to the bot to save it in data/uploads.\n"
         "All actions require authorization. Only configured users can control this bot."
     )
     try:

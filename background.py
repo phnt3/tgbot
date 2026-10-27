@@ -49,6 +49,7 @@ class BackgroundMonitor:
         user_ids: Optional[Iterable[int]] = None,
         interval_seconds: Optional[int] = None,
         history_rows: int = DEFAULT_HISTORY_ROWS,
+        notifier: Optional[Any] = None,
     ) -> None:
         """Initialize the background monitor.
 
@@ -59,11 +60,13 @@ class BackgroundMonitor:
             user_ids: Telegram user IDs that receive alerts.
             interval_seconds: Sampling interval; defaults to alerts.json.
             history_rows: Maximum rows kept per history table.
+            notifier: Optional ``notifier.Notifier`` polled for PC events.
         """
         settings = load_alert_settings()
 
         self.bot = bot
         self.db = db
+        self.notifier = notifier
         self.alert_manager = alert_manager or AlertManager(
             db,
             thresholds=settings["thresholds"],
@@ -144,11 +147,29 @@ class BackgroundMonitor:
         for alert in alerts:
             await self.send_alert(alert)
 
+        events: List[Dict[str, Any]] = []
+        if self.notifier is not None:
+            try:
+                events = await asyncio.to_thread(self.notifier.poll)
+            except Exception:
+                logger.exception("PC event poll failed")
+                events = []
+            for event in events:
+                try:
+                    self.db.insert_alert(
+                        str(event.get("level", "info")),
+                        str(event.get("category", "notification")),
+                        str(event.get("message", "")),
+                    )
+                except Exception as e:
+                    logger.error("Failed to record PC event: %s", e)
+                await self.send_alert(event)
+
         self._cycles += 1
         if self._cycles % PRUNE_EVERY_CYCLES == 0:
             await self._prune_history()
 
-        return alerts
+        return alerts + events
 
     def record_metrics(self, metrics: Dict[str, Any]) -> None:
         """Persist one metrics snapshot to the history tables.
