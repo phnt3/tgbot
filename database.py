@@ -412,13 +412,13 @@ class Database:
         try:
             query = (
                 "SELECT timestamp, level, category, message, acknowledged FROM alerts "
-                "ORDER BY timestamp DESC LIMIT ?"
+                "ORDER BY timestamp DESC, id DESC LIMIT ?"
             )
             params = [limit]
             if acknowledged_only:
                 query = (
                     "SELECT timestamp, level, category, message, acknowledged FROM alerts "
-                    "WHERE acknowledged = 1 ORDER BY timestamp DESC LIMIT ?"
+                    "WHERE acknowledged = 1 ORDER BY timestamp DESC, id DESC LIMIT ?"
                 )
                 params = [limit]
             cursor = self._conn.execute(query, params)

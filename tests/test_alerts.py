@@ -64,6 +64,45 @@ def test_cooldown_suppresses_repeats(tmp_path):
     manager.db.close()
 
 
+def test_infinite_cooldown_alerts_once_per_breach(tmp_path):
+    manager = _manager(tmp_path, cooldowns={"disk_utilization": float("inf")})
+
+    breach = manager.evaluate_metrics(_metrics(disks={"Q:\\": {"utilization_percent": 89.7}}))
+    assert len(breach) == 1
+    assert "(still high)" not in breach[0]["message"]
+
+    # Same breach keeps being suppressed: no repeats, ever
+    for _ in range(5):
+        assert manager.evaluate_metrics(
+            _metrics(disks={"Q:\\": {"utilization_percent": 89.7}})
+        ) == []
+
+    # A real recovery is still reported once
+    recovery = manager.evaluate_metrics(_metrics(disks={"Q:\\": {"utilization_percent": 50}}))
+    assert len(recovery) == 1
+    assert recovery[0]["category"] == "recovery"
+
+    # ...and a new breach alerts again
+    assert len(manager.evaluate_metrics(_metrics(disks={"Q:\\": {"utilization_percent": 90}}))) == 1
+    manager.db.close()
+
+
+def test_recovery_requires_hysteresis_margin(tmp_path):
+    manager = _manager(tmp_path, thresholds={"cpu_temperature": 80})
+
+    assert len(manager.evaluate_metrics(_metrics(cpu_temp=85))) == 1
+
+    # Just below the threshold is not a recovery yet (margin 2 °C)
+    assert manager.evaluate_metrics(_metrics(cpu_temp=79.5)) == []
+    assert manager.evaluate_metrics(_metrics(cpu_temp=85)) == []
+
+    # Clearly below the margin: recovery fires once
+    recovery = manager.evaluate_metrics(_metrics(cpu_temp=77))
+    assert len(recovery) == 1
+    assert recovery[0]["category"] == "recovery"
+    manager.db.close()
+
+
 def test_critical_level_above_margin(tmp_path):
     manager = _manager(tmp_path, thresholds={"cpu_temperature": 80})
 
@@ -99,10 +138,11 @@ def test_disk_threshold_state_is_per_drive(tmp_path):
     )
     assert len(both) == 2
 
-    # C drops to exactly the threshold, D stays high
+    # C drops clearly below the threshold (past the hysteresis margin),
+    # D stays high
     changed = manager.evaluate_metrics(
         _metrics(disks={
-            "C:\\": {"utilization_percent": 85},
+            "C:\\": {"utilization_percent": 80},
             "D:\\": {"utilization_percent": 90},
         })
     )
@@ -161,6 +201,36 @@ def test_get_recent_alerts_returns_formatted_dicts(tmp_path):
     manager.db.close()
 
 
+def test_restart_does_not_resend_active_breach(tmp_path):
+    db_path = tmp_path / "alerts.db"
+
+    def manager() -> AlertManager:
+        return AlertManager(Database(db_path))
+
+    first = manager()
+    metrics = _metrics(disks={"Q:\\": {"utilization_percent": 89.7}})
+    assert len(first.evaluate_metrics(metrics)) == 1
+    first.db.close()
+
+    # A fresh process restores the still-open breach instead of alerting again
+    second = manager()
+    assert second.evaluate_metrics(metrics) == []
+    second.db.close()
+
+
+def test_restart_alerts_after_recovery(tmp_path):
+    db_path = tmp_path / "alerts.db"
+
+    first = AlertManager(Database(db_path))
+    assert len(first.evaluate_metrics(_metrics(cpu_temp=90))) == 1
+    assert len(first.evaluate_metrics(_metrics(cpu_temp=60))) == 1  # recovery
+    first.db.close()
+
+    second = AlertManager(Database(db_path))
+    assert len(second.evaluate_metrics(_metrics(cpu_temp=90))) == 1
+    second.db.close()
+
+
 def test_load_alert_settings_defaults(tmp_path):
     missing = tmp_path / "missing.json"
     settings = load_alert_settings(missing)
@@ -209,6 +279,18 @@ def test_load_alert_settings_clamps_max_interval(tmp_path):
     path.write_text(json.dumps({"interval_seconds": 10**9}), encoding="utf-8")
     settings = load_alert_settings(path)
     assert settings["interval_seconds"] == alerts.MAX_INTERVAL_SECONDS
+
+
+def test_load_alert_settings_null_cooldown_means_never(tmp_path):
+    path = tmp_path / "alerts.json"
+    path.write_text(
+        json.dumps({"cooldowns": {"disk_utilization": None}}), encoding="utf-8"
+    )
+    settings = load_alert_settings(path)
+    assert settings["cooldowns"]["disk_utilization"] == float("inf")
+    assert settings["cooldowns"]["cpu_temperature"] == (
+        alerts.DEFAULT_COOLDOWNS["cpu_temperature"]
+    )
 
 
 def test_alert_timestamps_use_current_time(tmp_path):

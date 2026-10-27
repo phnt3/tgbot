@@ -10,6 +10,6 @@
     "cpu_temperature": 300,
     "gpu_temperature": 300,
     "ram_utilization": 600,
-    "disk_utilization": 600
+    "disk_utilization": null
   }
 }

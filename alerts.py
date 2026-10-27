@@ -16,12 +16,19 @@ Settings can be overridden with ``config/alerts.json``:
       "thresholds": {"cpu_temperature": 80, "gpu_temperature": 80,
                      "ram_utilization": 85, "disk_utilization": 85},
       "cooldowns":  {"cpu_temperature": 300, "gpu_temperature": 300,
-                     "ram_utilization": 600, "disk_utilization": 600}
+                     "ram_utilization": 600, "disk_utilization": null}
     }
+
+A cooldown of ``null`` disables repeats entirely: one alert per breach, and
+the next one only after the value has recovered and crossed the threshold
+again. Recovery notifications also use a small hysteresis margin so a metric
+hovering exactly at its threshold cannot flap between "too high" and
+"recovered".
 """
 
 import json
 import logging
+import math
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -52,6 +59,17 @@ DEFAULT_INTERVAL_SECONDS = 60
 MIN_INTERVAL_SECONDS = 15
 MAX_INTERVAL_SECONDS = 86400
 
+# A breached metric is only considered recovered once it drops this far below
+# the threshold (in the metric's own unit: °C or percentage points). Without
+# the margin a value sitting exactly on the threshold would flap between
+# "too high" and "recovered" on every poll.
+DEFAULT_RECOVERY_MARGINS: Dict[str, float] = {
+    "cpu_temperature": 2.0,
+    "gpu_temperature": 2.0,
+    "ram_utilization": 2.0,
+    "disk_utilization": 2.0,
+}
+
 ALERT_CONFIG_PATH = Path(__file__).resolve().parent / "config" / "alerts.json"
 
 
@@ -70,7 +88,8 @@ def load_alert_settings(path: Optional[Path] = None) -> Dict[str, Any]:
     """Load alert settings, merging an optional JSON file over the defaults.
 
     Unknown keys and invalid values are ignored instead of crashing the bot,
-    so a mistyped config can never disable monitoring.
+    so a mistyped config can never disable monitoring. A cooldown of ``null``
+    is valid and means "never repeat while the breach stays active".
 
     Args:
         path: Optional path to a JSON settings file.
@@ -104,6 +123,10 @@ def load_alert_settings(path: Optional[Path] = None) -> Dict[str, Any]:
             continue
         for key, value in values.items():
             if key not in settings[section]:
+                continue
+            if section == "cooldowns" and value is None:
+                # null = alert once per breach, never repeat while it lasts.
+                settings[section][key] = math.inf
                 continue
             number = _positive_float(value)
             if number is None:
@@ -147,12 +170,16 @@ class AlertManager:
             self.cooldowns.update(
                 {k: v for k, v in cooldowns.items() if k in DEFAULT_COOLDOWNS}
             )
+        self.recovery_margins = dict(DEFAULT_RECOVERY_MARGINS)
 
         # Keys currently in a breached state, e.g. "cpu_temperature" or
         # "disk_utilization:C:".
         self._active: Set[str] = set()
         # Last time an alert was emitted per key (cooldown bookkeeping).
         self._last_alert: Dict[str, float] = {}
+        # Breach state is restored from the database once, so a restart does
+        # not re-send alerts for problems that are still active.
+        self._seeded = False
 
     # -- public API -----------------------------------------------------
 
@@ -200,6 +227,7 @@ class AlertManager:
         gpu = metrics.get("gpu") or {}
         ram = metrics.get("ram") or {}
         disks = metrics.get("disk") or {}
+        self._seed_from_history(disks, now)
 
         alert = self._evaluate_metric(
             key="cpu_temperature",
@@ -212,6 +240,7 @@ class AlertManager:
             value_format="{:.1f} °C",
             threshold_format="{} °C",
             critical_margin=10,
+            recovery_margin=self.recovery_margins["cpu_temperature"],
         )
         if alert:
             alerts.append(alert)
@@ -227,6 +256,7 @@ class AlertManager:
             value_format="{:.1f} °C",
             threshold_format="{} °C",
             critical_margin=10,
+            recovery_margin=self.recovery_margins["gpu_temperature"],
         )
         if alert:
             alerts.append(alert)
@@ -242,6 +272,7 @@ class AlertManager:
             value_format="{:.1f}%",
             threshold_format="{}%",
             critical_margin=None,
+            recovery_margin=self.recovery_margins["ram_utilization"],
         )
         if alert:
             alerts.append(alert)
@@ -261,6 +292,7 @@ class AlertManager:
                     value_format="{:.1f}%",
                     threshold_format="{}%",
                     critical_margin=None,
+                    recovery_margin=self.recovery_margins["disk_utilization"],
                 )
                 if alert:
                     alerts.append(alert)
@@ -305,6 +337,45 @@ class AlertManager:
 
     # -- internals ------------------------------------------------------
 
+    def _seed_from_history(self, disks: Any, now: float) -> None:
+        """Restore active breaches from the alerts table (once per process).
+
+        The in-memory breach state is lost on restart, which used to re-send
+        every alert that was still true. Looking at the newest alert per
+        metric tells us whether a breach is still open, so a restart stays
+        quiet and the "alert once" cooldown actually holds across restarts.
+
+        Args:
+            disks: Disk metrics mapping (postpones seeding until metrics exist).
+            now: Current Unix timestamp, stored as the cooldown reference.
+        """
+        if self._seeded or not isinstance(disks, dict):
+            return
+        self._seeded = True
+
+        labels: Dict[str, str] = {
+            "cpu_temperature": "CPU temperature",
+            "gpu_temperature": "GPU temperature",
+            "ram_utilization": "RAM utilization",
+        }
+        for drive in disks:
+            labels[f"disk_utilization:{drive}"] = f"Disk {drive} utilization"
+
+        try:
+            recent = self.db.get_recent_alerts(limit=200)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("Could not restore alert state from history: %s", e)
+            return
+
+        for key, label in labels.items():
+            for _ts, _level, _category, message, _ack in recent:
+                if label not in message:
+                    continue
+                if "too high" in message:
+                    self._active.add(key)
+                    self._last_alert[key] = now
+                break
+
     def _agent_error(self, reason: str) -> List[Dict[str, Any]]:
         """Emit at most one alert for a run of metric-collection failures."""
         now = time.time()
@@ -339,6 +410,7 @@ class AlertManager:
         value_format: str,
         threshold_format: str,
         critical_margin: Optional[float],
+        recovery_margin: float = 0.0,
     ) -> Optional[Dict[str, Any]]:
         """Compare one metric with its threshold and update alert state.
 
@@ -348,11 +420,14 @@ class AlertManager:
             label: Human-readable metric name.
             value: Raw value from metrics (may be None or "N/A").
             threshold: Upper bound before an alert is raised.
-            cooldown: Seconds between repeated alerts for an active breach.
+            cooldown: Seconds between repeated alerts for an active breach
+                (``math.inf`` disables repeats while the breach lasts).
             now: Current Unix timestamp.
             value_format: Format string for the measured value.
             threshold_format: Format string for the threshold.
             critical_margin: If set, values above threshold+margin are critical.
+            recovery_margin: How far below the threshold the value must drop
+                before the breach counts as recovered (hysteresis).
 
         Returns:
             A new alert dict, or None if nothing new happened.
@@ -392,6 +467,10 @@ class AlertManager:
 
         # Value is within bounds. Emit recovery only for a real transition.
         if key in self._active:
+            # Hysteresis: stay active until the value drops clearly below the
+            # threshold, otherwise a metric sitting on the threshold flaps.
+            if measured > threshold - recovery_margin:
+                return None
             self._active.discard(key)
             self._last_alert.pop(key, None)
             return self._record(
