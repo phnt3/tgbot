@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.dist-info/
+.env
+*.env.*
+!/.env.example
+
+# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# Database
+*.db
+*.db-wal
+*.db-shm
+pc_remote.db*
+data/
+
+# Runtime state
+*.lock
+*.log
+.pytest_cache/
+
+# Logs
+logs/
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Screenshots (unless configured otherwise)
+screenshots/

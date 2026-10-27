@@ -1,0 +1,22 @@
+{
+  "GAMING": {
+    "description": "Launch gaming applications and launchers",
+    "apps": ["steam"],
+    "optional": []
+  },
+  "VR": {
+    "description": "Launch VR applications",
+    "apps": ["steam"],
+    "optional": []
+  },
+  "WORK": {
+    "description": "Launch productivity applications",
+    "apps": ["notepad"],
+    "optional": []
+  },
+  "NORMAL": {
+    "description": "Display current system status without changing anything",
+    "apps": [],
+    "optional": []
+  }
+}

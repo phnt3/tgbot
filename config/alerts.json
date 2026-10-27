@@ -1,0 +1,15 @@
+{
+  "interval_seconds": 60,
+  "thresholds": {
+    "cpu_temperature": 80,
+    "gpu_temperature": 80,
+    "ram_utilization": 85,
+    "disk_utilization": 85
+  },
+  "cooldowns": {
+    "cpu_temperature": 300,
+    "gpu_temperature": 300,
+    "ram_utilization": 600,
+    "disk_utilization": 600
+  }
+}
