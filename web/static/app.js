@@ -2915,7 +2915,12 @@ function alertItemHtml(alert) {
   function appFileTitle(path) {
     const parts = String(path || '').split(/[\\/]/).filter(Boolean);
     const name = parts.length ? parts[parts.length - 1] : '';
-    return name.replace(/\.(exe|lnk|bat|cmd|com)$/i, '');
+    return name.replace(/\.(exe|lnk|bat|cmd|com)$/i, '')
+      .replace(/[^a-zA-Z0-9\s.\-_+]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 40)
+      .trim();
   }
 
   function appPickerCrumbsHtml() {
