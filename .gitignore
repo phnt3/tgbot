@@ -31,6 +31,9 @@ data/
 config/applications.json
 config/profiles.json
 
+# Local design mockups (not part of the shipped bot)
+design/
+
 # Logs
 logs/
 

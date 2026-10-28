@@ -1,6 +1,8 @@
 """Main entry point for PC Remote bot.
 
-Initializes the application, sets up logging, and starts the Telegram bot.
+Initializes the application, sets up logging, starts the LAN web panel and
+then connects to Telegram. The panel starts first, so the PC stays reachable
+from a browser even while the VPN or proxy keeps Telegram offline.
 """
 
 import asyncio
@@ -9,12 +11,28 @@ import sys
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, types
+from aiogram.exceptions import TelegramUnauthorizedError
 from aiogram.filters import Command
 
 from config import config, load_config
 from database import Database
 from handlers.init import cmd_start, cmd_help, cmd_status
 from handlers.common import send_welcome, show_main_menu
+
+TELEGRAM_RETRY_SECONDS = 15
+TELEGRAM_STATUS_SECONDS = 60
+
+
+async def watch_telegram(bot: Bot, state: dict) -> None:
+    """Keep the panel's Telegram badge close to reality."""
+    while True:
+        try:
+            await bot.get_me()
+        except Exception:  # noqa: BLE001 - any network error means offline
+            state["status"] = "offline"
+        else:
+            state["status"] = "online"
+        await asyncio.sleep(TELEGRAM_STATUS_SECONDS)
 
 
 def setup_logging() -> None:
@@ -67,6 +85,11 @@ async def main() -> None:
 
     background = None
     scheduler = None
+    panel = None
+    telegram_state = {"status": "connecting"}
+
+    def telegram_status() -> str:
+        return telegram_state["status"]
 
     # Initialize database
     try:
@@ -149,15 +172,64 @@ async def main() -> None:
         features.set_scheduler(scheduler)
         scheduler.start()
 
+        # The panel does not depend on Telegram: start it before the
+        # connectivity check so a browser can control the PC offline.
+        from web import start_panel
+
+        panel = start_panel(
+            data_dir=config["DATA_DIR"],
+            db_path=db_path,
+            scheduler=scheduler,
+            telegram_status=telegram_status,
+        )
+        if panel is not None:
+            logger.info(
+                "Web panel started: %s (LAN %s)",
+                panel.panel_info["urls"].get("local"),
+                panel.panel_info["urls"].get("lan"),
+            )
+
     except Exception as e:
         logger.error(f"Failed to create bot: {e}")
         db.close()
         sys.exit(1)
 
     # Cleanup on shutdown
+    watcher = None
     try:
+        # Telegram may be blocked while the VPN/proxy is down. Retry here
+        # instead of exiting, so the web panel keeps serving the LAN.
+        while True:
+            try:
+                me = await bot.get_me()
+            except TelegramUnauthorizedError:
+                telegram_state["status"] = "error"
+                logger.error("Telegram rejected BOT_TOKEN; stopping the bot")
+                return
+            except Exception as e:  # noqa: BLE001 - network/proxy errors
+                telegram_state["status"] = "offline"
+                logger.warning(
+                    "Telegram is unreachable (%s); panel stays up, retrying in %ss",
+                    e,
+                    TELEGRAM_RETRY_SECONDS,
+                )
+                await asyncio.sleep(TELEGRAM_RETRY_SECONDS)
+            else:
+                telegram_state["status"] = "online"
+                logger.info("Telegram connected as @%s", me.username)
+                break
+
+        watcher = asyncio.create_task(
+            watch_telegram(bot, telegram_state), name="telegram-watch"
+        )
         await dispatcher.start_polling(bot, skip_updates=True)
     finally:
+        if watcher is not None:
+            watcher.cancel()
+            try:
+                await watcher
+            except (asyncio.CancelledError, Exception):
+                pass
         if scheduler is not None:
             try:
                 await scheduler.stop()
@@ -168,6 +240,11 @@ async def main() -> None:
                 await background.stop()
             except Exception as e:
                 logger.error(f"Failed to stop background monitor: {e}")
+        if panel is not None:
+            try:
+                panel.stop()
+            except Exception as e:
+                logger.error(f"Failed to stop web panel: {e}")
         try:
             await bot.session.close()
         except Exception:

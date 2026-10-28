@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -77,6 +78,9 @@ class TaskScheduler:
         self._tasks: List[Dict[str, Any]] = []
         self._next_id = 1
         self._loop_task: Optional[asyncio.Task] = None
+        # The web panel reads and mutates the task list from HTTP worker
+        # threads while the event loop ticks, so every list access is guarded.
+        self._lock = threading.RLock()
         self._load()
 
     # -- persistence ----------------------------------------------------
@@ -146,6 +150,11 @@ class TaskScheduler:
 
     def _save(self) -> None:
         """Atomically write the task list to disk."""
+        with self._lock:
+            self._save_unlocked()
+
+    def _save_unlocked(self) -> None:
+        """Write the task list; caller already holds ``_lock``."""
         try:
             self.storage_path.parent.mkdir(parents=True, exist_ok=True)
             temp_path = self.storage_path.with_name(
@@ -198,18 +207,19 @@ class TaskScheduler:
         if action == "profile" and not str(clean_params.get("profile", "")).strip():
             raise ValueError("Profile action requires a profile name")
 
-        task = {
-            "id": self._next_id,
-            "action": action,
-            "label": str(label or ACTION_LABELS.get(action, action)),
-            "run_at": run_at,
-            "created_at": self._clock(),
-            "params": clean_params,
-        }
-        self._next_id += 1
-        self._tasks.append(task)
-        self._tasks.sort(key=lambda item: item["run_at"])
-        self._save()
+        with self._lock:
+            task = {
+                "id": self._next_id,
+                "action": action,
+                "label": str(label or ACTION_LABELS.get(action, action)),
+                "run_at": run_at,
+                "created_at": self._clock(),
+                "params": clean_params,
+            }
+            self._next_id += 1
+            self._tasks.append(task)
+            self._tasks.sort(key=lambda item: item["run_at"])
+            self._save_unlocked()
         return dict(task)
 
     def add_delay(
@@ -229,24 +239,29 @@ class TaskScheduler:
 
     def list_tasks(self) -> List[Dict[str, Any]]:
         """Return a copy of all pending tasks, soonest first."""
-        return [dict(task) for task in self._tasks]
+        with self._lock:
+            return [dict(task) for task in self._tasks]
 
     def cancel(self, task_id: int) -> bool:
         """Cancel one task by id. Returns True when something was removed."""
-        before = len(self._tasks)
-        self._tasks = [task for task in self._tasks if task["id"] != int(task_id)]
-        if len(self._tasks) == before:
-            return False
-        self._save()
-        return True
+        with self._lock:
+            before = len(self._tasks)
+            self._tasks = [
+                task for task in self._tasks if task["id"] != int(task_id)
+            ]
+            if len(self._tasks) == before:
+                return False
+            self._save_unlocked()
+            return True
 
     def cancel_all(self) -> int:
         """Cancel every pending task and return how many were removed."""
-        removed = len(self._tasks)
-        if removed:
-            self._tasks = []
-            self._save()
-        return removed
+        with self._lock:
+            removed = len(self._tasks)
+            if removed:
+                self._tasks = []
+                self._save_unlocked()
+            return removed
 
     # -- execution ------------------------------------------------------
 
@@ -260,13 +275,16 @@ class TaskScheduler:
             List of result dicts: task, ok, message.
         """
         current = self._clock() if now is None else float(now)
-        due = [task for task in self._tasks if task["run_at"] <= current]
-        if not due:
-            return []
+        with self._lock:
+            due = [task for task in self._tasks if task["run_at"] <= current]
+            if not due:
+                return []
 
-        due_ids = {task["id"] for task in due}
-        self._tasks = [task for task in self._tasks if task["id"] not in due_ids]
-        self._save()
+            due_ids = {task["id"] for task in due}
+            self._tasks = [
+                task for task in self._tasks if task["id"] not in due_ids
+            ]
+            self._save_unlocked()
 
         results: List[Dict[str, Any]] = []
         for task in due:

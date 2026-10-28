@@ -1,8 +1,11 @@
 """Launcher (supervisor) for the PC Remote bot.
 
 Started by the Windows Startup shortcut with pythonw.exe, so no console
-window appears. Waits until Telegram is reachable (VPN/proxy may start
-later than Windows), then runs main.py and restarts it after crashes.
+window appears. Starts main.py immediately and restarts it after crashes.
+
+The bot process owns the LAN web panel and connects to Telegram on its own,
+so waiting for api.telegram.org here would leave the panel unreachable while
+the VPN or proxy is down.
 
 Log file: logs/launcher.log
 """
@@ -10,7 +13,6 @@ Log file: logs/launcher.log
 import logging
 import msvcrt
 import os
-import socket
 import subprocess
 import sys
 import time
@@ -21,10 +23,6 @@ LOG_DIR = BASE_DIR / "logs"
 DATA_DIR = BASE_DIR / "data"
 LOCK_FILE = DATA_DIR / "launcher.lock"
 
-HOST = "api.telegram.org"
-PORT = 443
-CONNECT_TIMEOUT = 5
-CHECK_INTERVAL = 15
 RESTART_DELAY = 30
 LOCK_BYTES = 1
 
@@ -55,24 +53,6 @@ def acquire_lock():
     return lock_file
 
 
-def network_ready() -> bool:
-    try:
-        with socket.create_connection((HOST, PORT), timeout=CONNECT_TIMEOUT):
-            return True
-    except OSError:
-        return False
-
-
-def wait_for_network() -> None:
-    attempt = 0
-    while not network_ready():
-        attempt += 1
-        if attempt == 1 or attempt % 4 == 0:
-            logger.info("Telegram is unreachable, waiting (attempt %s)", attempt)
-        time.sleep(CHECK_INTERVAL)
-    logger.info("Telegram is reachable")
-
-
 def run_bot() -> int:
     logger.info("Starting bot")
     result = subprocess.run(
@@ -94,7 +74,6 @@ def main() -> int:
 
     logger.info("Launcher started (pid=%s)", os.getpid())
     while True:
-        wait_for_network()
         code = run_bot()
         if code == 0:
             logger.info("Clean shutdown, launcher exiting")

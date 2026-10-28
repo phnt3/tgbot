@@ -432,6 +432,46 @@ class Database:
         except sqlite3.Error as e:
             raise RuntimeError(f"Failed to query alerts: {e}")
 
+    def count_unacknowledged_alerts(self) -> int:
+        """Return how many alerts are still unacknowledged."""
+        if self._conn is None:
+            raise RuntimeError("Database connection not established")
+        try:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM alerts WHERE acknowledged = 0"
+            ).fetchone()
+            return int(row[0]) if row else 0
+        except sqlite3.Error as e:
+            raise RuntimeError(f"Failed to count alerts: {e}")
+
+    def acknowledge_alerts(self, timestamp: Optional[float] = None) -> int:
+        """Mark alerts as acknowledged.
+
+        Args:
+            timestamp: When given, only the alert with this exact timestamp is
+                acknowledged. When omitted, every pending alert is acknowledged.
+
+        Returns:
+            Number of rows that changed.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database connection not established")
+        try:
+            if timestamp is None:
+                cursor = self._conn.execute(
+                    "UPDATE alerts SET acknowledged = 1 WHERE acknowledged = 0"
+                )
+            else:
+                cursor = self._conn.execute(
+                    "UPDATE alerts SET acknowledged = 1 "
+                    "WHERE acknowledged = 0 AND timestamp = ?",
+                    (float(timestamp),),
+                )
+            self._conn.commit()
+            return int(cursor.rowcount or 0)
+        except sqlite3.Error as e:
+            raise RuntimeError(f"Failed to acknowledge alerts: {e}")
+
     def get_recent_app_launches(self, limit: int = 50) -> List[Tuple[float, str, int, Optional[str]]]:
         """Get recent application launch records.
 
