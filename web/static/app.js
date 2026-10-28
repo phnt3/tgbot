@@ -1466,12 +1466,12 @@ function alertItemHtml(alert) {
     return nodes.join('');
   }
 
-  function driveTileHtml(drive) {
+  function driveTileHtml(drive, act) {
     const total = Number(drive.total) || 0;
     const free = Number(drive.free) || 0;
     const percent = isNum(drive.percent) ? drive.percent : total > 0 ? ((total - free) / total) * 100 : 0;
     return (
-      '<button type="button" class="drive-tile" data-act="file-open" data-dir="1" data-path="' + esc(drive.path) + '">' +
+      '<button type="button" class="drive-tile" data-act="' + esc(act || 'file-open') + '" data-dir="1" data-path="' + esc(drive.path) + '">' +
       '<div class="drive-head"><span class="drive-icon">' + icon('disk') + '</span>' +
       '<div><strong>' + esc(drive.name || drive.path) + '</strong>' +
       '<span class="drive-sub">' + esc(drive.fstype || '') + (total ? ' · ' + esc(fmtBytes(total)) : '') + '</span></div></div>' +
@@ -2895,6 +2895,140 @@ function alertItemHtml(alert) {
     return String(digits == null ? value : Math.round(value * Math.pow(10, digits)) / Math.pow(10, digits));
   }
 
+  const APP_PICKER = {
+    kind: 'drives',
+    path: null,
+    parent: null,
+    entries: [],
+    drives: [],
+    all: false,
+    target: null,
+  };
+  const APP_FILE_EXTENSIONS = ['exe', 'lnk', 'bat', 'cmd', 'com'];
+
+  function isExecutableAppFile(name) {
+    const value = String(name || '').toLowerCase();
+    const dot = value.lastIndexOf('.');
+    return dot >= 0 && APP_FILE_EXTENSIONS.indexOf(value.slice(dot + 1)) >= 0;
+  }
+
+  function appFileTitle(path) {
+    const parts = String(path || '').split(/[\\/]/).filter(Boolean);
+    const name = parts.length ? parts[parts.length - 1] : '';
+    return name.replace(/\.(exe|lnk|bat|cmd|com)$/i, '');
+  }
+
+  function appPickerCrumbsHtml() {
+    if (APP_PICKER.kind !== 'dir' || !APP_PICKER.path) {
+      return '<span class="crumb current">Диски</span>';
+    }
+    const parts = crumbParts(APP_PICKER.path);
+    const nodes = ['<button type="button" class="crumb" data-act="app-picker-drives">Диски</button>'];
+    parts.forEach(function (part, index) {
+      nodes.push('<span class="crumb-sep">›</span>');
+      if (index === parts.length - 1) {
+        nodes.push('<span class="crumb current">' + esc(part.label) + '</span>');
+      } else {
+        nodes.push('<button type="button" class="crumb" data-act="app-picker-open" data-path="' +
+          esc(part.path) + '">' + esc(part.label) + '</button>');
+      }
+    });
+    return nodes.join('');
+  }
+
+  function appPickerRowHtml(entry) {
+    const isDir = !!entry.is_dir;
+    return (
+      '<button type="button" class="app-picker-item" data-act="' +
+      (isDir ? 'app-picker-open' : 'app-picker-pick') + '" data-path="' + esc(entry.path) +
+      '" title="' + esc(entry.path) + '">' +
+      '<span class="file-icon' + (isDir ? ' dir' : '') + '">' + icon(isDir ? 'folder' : 'file') + '</span>' +
+      '<span class="app-picker-name">' + esc(entry.name) + '</span>' +
+      '<span class="app-picker-size">' + (isDir ? 'папка' : esc(fileSizeText(entry.size))) + '</span>' +
+      '</button>'
+    );
+  }
+
+  function appPickerListHtml() {
+    if (APP_PICKER.kind !== 'dir') {
+      const drives = APP_PICKER.drives || [];
+      if (!drives.length) {
+        return emptyBox('disk', 'Диски не найдены', 'Не удалось получить список разделов.');
+      }
+      return '<div class="drive-grid">' + drives.map(function (drive) {
+        return driveTileHtml(drive, 'app-picker-open');
+      }).join('') + '</div>';
+    }
+    const entries = (APP_PICKER.entries || []).filter(function (entry) {
+      return entry.is_dir || APP_PICKER.all || isExecutableAppFile(entry.name);
+    });
+    if (!entries.length) {
+      return emptyBox('folder', 'Ничего не найдено',
+        APP_PICKER.all ? 'В этой папке нет файлов.' : 'Нет .exe или .lnk. Включите «Все файлы».');
+    }
+    return entries.map(appPickerRowHtml).join('');
+  }
+
+  function appPickerBodyHtml() {
+    const atDrives = APP_PICKER.kind !== 'dir';
+    const path = atDrives ? '' : (APP_PICKER.path || '');
+    return (
+      '<div class="app-picker">' +
+      '<div class="app-picker-bar">' +
+      '<button type="button" class="iconbtn sm" data-act="app-picker-up" title="Наверх"' +
+      (atDrives ? ' disabled' : '') + '>' + icon('up') + '</button>' +
+      '<div class="crumbs">' + appPickerCrumbsHtml() + '</div>' +
+      '<button type="button" class="iconbtn sm" data-act="app-picker-refresh" title="Обновить">' +
+      icon('refresh') + '</button></div>' +
+      '<form class="app-picker-go" data-form="app-picker-jump">' +
+      '<input class="input" name="path" value="' + esc(path) +
+      '" placeholder="C:\\Program Files" autocomplete="off" spellcheck="false">' +
+      '<button type="submit" class="btn sm">Перейти</button></form>' +
+      '<div class="app-picker-toolbar"><span class="app-picker-hint">' +
+      (atDrives ? 'Выберите диск' : 'Папки открываются, файл выбирается нажатием') +
+      '</span><label class="check"><input type="checkbox" data-change="app-picker-all"' +
+      (APP_PICKER.all ? ' checked' : '') + '><span>Все файлы</span></label></div>' +
+      '<div class="app-picker-list" id="app-picker-list">' + appPickerListHtml() + '</div>' +
+      '</div>'
+    );
+  }
+
+  function appPickerRender() {
+    const host = $('#app-picker-body');
+    if (host) host.innerHTML = appPickerBodyHtml();
+  }
+
+  async function appPickerLoad(path) {
+    const data = await api(path ? '/api/files?path=' + encodeURIComponent(path) : '/api/files');
+    APP_PICKER.kind = data.kind === 'dir' ? 'dir' : 'drives';
+    APP_PICKER.path = APP_PICKER.kind === 'dir' ? data.path : null;
+    APP_PICKER.parent = APP_PICKER.kind === 'dir' ? data.parent : null;
+    APP_PICKER.entries = data.entries || [];
+    APP_PICKER.drives = data.drives || [];
+    appPickerRender();
+  }
+
+  function openAppPicker(target) {
+    APP_PICKER.target = target || null;
+    APP_PICKER.kind = 'drives';
+    APP_PICKER.path = null;
+    APP_PICKER.parent = null;
+    APP_PICKER.entries = [];
+    APP_PICKER.drives = [];
+    APP_PICKER.all = false;
+    openModal({
+      title: 'Выбор программы',
+      wide: true,
+      body: '<div id="app-picker-body"><div class="loading-box"><span class="spinner"></span>' +
+        '<span>Читаю диски…</span></div></div>',
+      footer: '<button type="button" class="btn ghost" data-act="modal-close">Отмена</button>',
+    });
+    appPickerLoad(null).catch(function (error) {
+      const host = $('#app-picker-body');
+      if (host) host.innerHTML = emptyBox('folder', 'Не удалось открыть', describeError(error));
+    });
+  }
+
   function appEditRow(name, path) {
     return (
       '<div class="app-edit-row" data-app-row>' +
@@ -2902,6 +3036,8 @@ function alertItemHtml(alert) {
       'maxlength="40" autocomplete="off" spellcheck="false">' +
       '<input class="input app-path-input" name="app_path" value="' + esc(path || '') + '" ' +
       'placeholder="C:\\Путь\\к\\программе.exe" autocomplete="off" spellcheck="false">' +
+      '<button type="button" class="iconbtn sm" data-act="settings-app-browse" title="Выбрать файл" ' +
+      'aria-label="Выбрать файл">' + icon('folder') + '</button>' +
       '<button type="button" class="iconbtn sm" data-act="settings-app-remove" title="Удалить" ' +
       'aria-label="Удалить">' + icon('trash') + '</button>' +
       '</div>'
@@ -3284,6 +3420,56 @@ function settingsTabsHtml() {
   action('settings-app-remove', function (node) {
     const row = node.closest('[data-app-row]');
     if (row) row.remove();
+  });
+
+  action('settings-app-browse', function (node) {
+    const row = node.closest('[data-app-row]');
+    const input = row ? row.querySelector('[name="app_path"]') : null;
+    if (input) openAppPicker(input);
+  });
+
+  action('app-picker-drives', guarded(async function () {
+    await appPickerLoad(null);
+  }));
+
+  action('app-picker-open', guarded(async function (node) {
+    await appPickerLoad(node.getAttribute('data-path') || null);
+  }));
+
+  action('app-picker-up', guarded(async function () {
+    await appPickerLoad(APP_PICKER.kind === 'dir' ? APP_PICKER.parent : null);
+  }));
+
+  action('app-picker-refresh', guarded(async function () {
+    await appPickerLoad(APP_PICKER.kind === 'dir' ? APP_PICKER.path : null);
+  }));
+
+  action('app-picker-pick', function (node) {
+    const path = node.getAttribute('data-path') || '';
+    const target = APP_PICKER.target;
+    if (!path) return;
+    if (!target || !target.isConnected) {
+      closeModals();
+      toast('Строка приложения больше не доступна', 'warn');
+      return;
+    }
+    target.value = path;
+    const row = target.closest('[data-app-row]');
+    const nameInput = row ? row.querySelector('[name="app_name"]') : null;
+    if (nameInput && !nameInput.value.trim()) nameInput.value = appFileTitle(path);
+    closeModals();
+    toast('Путь выбран', 'ok', 1800);
+  });
+
+  onchange('app-picker-all', function (node) {
+    APP_PICKER.all = !!node.checked;
+    appPickerRender();
+  });
+
+  FORM['app-picker-jump'] = guarded(async function (form) {
+    const input = form.querySelector('[name="path"]');
+    const value = input ? input.value.trim() : '';
+    await appPickerLoad(value || null);
   });
 
   onchange('settings-never', function (node) {

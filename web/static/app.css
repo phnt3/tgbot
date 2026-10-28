@@ -1446,6 +1446,7 @@ svg { display: block; flex: none; }
   min-width: 160px;
 }
 .files-search .input { min-height: 34px; }
+.files-search > svg { width: 15px; height: 15px; flex: none; color: var(--muted); }
 
 .drive-grid {
   display: grid;
@@ -1619,6 +1620,51 @@ svg { display: block; flex: none; }
 .chip-list { display: flex; flex-wrap: wrap; gap: 5px; }
 .chip-list .pill { background: var(--panel); }
 .chip-list .pill.opt { border-style: dashed; color: var(--muted-2); }
+
+/* app path picker */
+.app-picker-bar { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+.app-picker-go { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; }
+.app-picker-go .input { flex: 1; min-width: 0; }
+.app-picker-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.app-picker-hint { color: var(--muted); font-size: 12px; }
+.app-picker-list {
+  max-height: 46vh;
+  overflow: auto;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-2);
+}
+.app-picker-list .drive-grid { padding: 6px; }
+.app-picker-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.app-picker-item:hover, .app-picker-item:focus-visible { background: var(--panel); }
+.app-picker-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.app-picker-size {
+  flex: none;
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
 
 /* ------------------------------------------------------------ power/media */
 
@@ -1794,7 +1840,7 @@ svg { display: block; flex: none; }
 .app-edit-list { display: grid; gap: 8px; }
 .app-edit-row {
   display: grid;
-  grid-template-columns: minmax(120px, .7fr) minmax(200px, 1.6fr) 34px;
+  grid-template-columns: minmax(120px, .7fr) minmax(200px, 1.6fr) 34px 34px;
   gap: 8px;
   align-items: center;
 }
@@ -1896,7 +1942,7 @@ svg { display: block; flex: none; }
   .topbar-titles h1 { font-size: 17px; }
   .page-head { margin-bottom: 12px; }
   .page-head .head-actions .btn .btn-label { display: none; }
-  .app-edit-row { grid-template-columns: minmax(0, 1fr) 34px; }
+  .app-edit-row { grid-template-columns: minmax(0, 1fr) 34px 34px; }
   .app-edit-row .app-path-input { grid-column: 1 / -1; grid-row: 2; }
   .speed-grid { grid-template-columns: 1fr 1fr 1fr; }
   .files-search { flex-basis: 100%; order: 5; }
