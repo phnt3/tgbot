@@ -140,3 +140,30 @@ def test_cleanup_prunes_history(tmp_path):
     # Other tables are pruned to the same minimum
     assert len(db.get_gpu_history(limit=100)) == 2
     db.close()
+
+
+def test_get_disk_devices_lists_distinct_drives(tmp_path):
+    db = Database(tmp_path / "charts.db")
+    now = time.time()
+    db.insert_disk_history("C:\\", 500000.0, 100000.0, 40.0, timestamp=now)
+    db.insert_disk_history("D:\\", 1000000.0, 500000.0, 50.0, timestamp=now)
+    db.insert_disk_history("D:\\", 1000000.0, 400000.0, 60.0, timestamp=now + 1)
+    db.insert_disk_history("", 1.0, 1.0, 0.0, timestamp=now + 2)
+
+    assert db.get_disk_devices() == ["C:\\", "D:\\"]
+    db.close()
+
+
+def test_render_disk_chart_for_explicit_drive(tmp_path):
+    db_path = tmp_path / "worker.db"
+    db = Database(db_path)
+    now = time.time()
+    db.insert_disk_history("C:\\", 500000.0, 100000.0, 40.0, timestamp=now)
+    db.insert_disk_history("D:\\", 1000000.0, 500000.0, 50.0, timestamp=now)
+    db.close()
+
+    png = render_chart(Path(db_path), "disk", "5m", device_id="D:\\")
+    assert png is not None
+    assert png.startswith(PNG_MAGIC)
+
+    assert render_chart(Path(db_path), "disk", "5m", device_id="Z:\\") is None

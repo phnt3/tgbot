@@ -14,9 +14,15 @@ from tests.fakes import FakeBot, FakeCallback, FakeMessage, button_datas
 @pytest.fixture(autouse=True)
 def reset_feature_state():
     features._FILE_STATE.clear()
+    features._FILE_PENDING.clear()
+    features._SEARCH_STATE.clear()
+    features._SEARCH_PENDING.clear()
     features.set_scheduler(None)
     yield
     features._FILE_STATE.clear()
+    features._FILE_PENDING.clear()
+    features._SEARCH_STATE.clear()
+    features._SEARCH_PENDING.clear()
     features.set_scheduler(None)
 
 
@@ -60,8 +66,8 @@ def test_file_browser_lists_entries_and_opens_directory(tmp_path):
     assert f"=== FILES: {tmp_path} ===" in body
     assert "Entries: 2 | Page 1/1" in body
     datas = button_datas(message.sent[0]["reply_markup"])
-    assert datas[:2] == ["fm_open_0", "fm_get_1"]
-    assert {"fm_home", "fm_up", "fm_refresh"}.issubset(datas)
+    assert datas[:4] == ["fm_open_0", "fm_act_0", "fm_get_1", "fm_act_1"]
+    assert {"fm_drives", "fm_up", "fm_refresh"}.issubset(datas)
 
     run(features.handle_callback(FakeCallback(), "fm_noop"))
     callback = FakeCallback()
@@ -133,7 +139,7 @@ def test_file_browser_rejects_wrong_entry_types_and_stale_state(tmp_path):
     callback.message.chat.id = 999
     run(features._handle_file_callback(callback, "fm_refresh"))
     assert callback.answers[-1]["text"] == "File browser expired"
-    assert f"=== FILES: {Path.home()} ===" in texts(callback.message)[0]
+    assert f"=== FILES: DRIVES ===" in texts(callback.message)[0]
 
 
 def test_file_browser_reports_unreadable_path(tmp_path):
@@ -288,6 +294,229 @@ def test_search_failure_is_reported(tmp_path, monkeypatch):
     assert run(features.handle_text(message)) is True
 
     assert "Search failed: bad" in texts(message)[-1]
+
+
+# --- File operations -------------------------------------------------------
+
+
+def _file_callback(message, data):
+    """Run one fm_* callback for the same chat and return the callback."""
+    callback = FakeCallback()
+    callback.message.chat.id = message.chat.id
+    run(features._handle_file_callback(callback, data))
+    return callback
+
+
+def test_file_browser_starts_with_drives_and_returns_to_them(tmp_path, monkeypatch):
+    drives = [
+        {"name": "C:\\", "path": "C:\\", "total": 100 * 1024**3, "free": 40 * 1024**3},
+        {"name": "D:\\", "path": "D:\\", "total": 0, "free": 0},
+    ]
+    monkeypatch.setattr(features, "list_drives", lambda: drives)
+    message = FakeMessage()
+
+    run(features.show_files(message))
+
+    body = texts(message)[0]
+    assert "=== FILES: DRIVES ===" in body
+    assert "Drives: 2" in body
+    sent = message.sent[0]
+    assert button_datas(sent["reply_markup"]) == [
+        "fm_drive_0",
+        "fm_drive_1",
+        "fm_refresh",
+        "menu_main",
+    ]
+    labels = [row[0].text for row in sent["reply_markup"].inline_keyboard]
+    assert "C:\\  40.0 GB free of 100.0 GB" in labels
+    assert "D:\\  (size unavailable)" in labels
+
+    # A drive root has no parent, so Up goes back to the drive picker.
+    features._FILE_STATE[message.chat.id] = {
+        "mode": "dir",
+        "path": "C:\\",
+        "parent": None,
+        "entries": [],
+        "page": 0,
+    }
+    callback = _file_callback(message, "fm_up")
+    assert "=== FILES: DRIVES ===" in texts(callback.message)[-1]
+
+
+def test_file_actions_menu_for_folder_and_file(tmp_path):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "note.txt").write_text("hello")
+    message = FakeMessage()
+    run(features.show_files(message, tmp_path))
+
+    callback = _file_callback(message, "fm_act_0")
+    body = texts(callback.message)[-1]
+    assert "=== FILE ACTIONS ===" in body
+    assert "Selected folder: docs" in body
+    datas = button_datas(callback.message.sent[-1]["reply_markup"])
+    assert "fm_get_0" not in datas
+    assert {
+        "fm_rename_0",
+        "fm_copy_0",
+        "fm_move_0",
+        "fm_delete_0",
+        "fm_cancel",
+    }.issubset(datas)
+
+    callback = _file_callback(message, "fm_act_1")
+    assert "Selected file: note.txt" in texts(callback.message)[-1]
+    assert "fm_get_1" in button_datas(callback.message.sent[-1]["reply_markup"])
+
+
+def test_rename_file_prompt_and_apply(tmp_path, monkeypatch):
+    _authorize(monkeypatch)
+    source = tmp_path / "old.txt"
+    source.write_text("data")
+    message = FakeMessage()
+    run(features.show_files(message, tmp_path))
+
+    prompt = _file_callback(message, "fm_rename_0")
+    body = texts(prompt.message)[-1]
+    assert "=== FILE OPERATION ===" in body
+    assert "Send a new name for: old.txt" in body
+    assert features._FILE_PENDING
+
+    message.text = "new.txt"
+    assert run(features.handle_text(message)) is True
+
+    assert not source.exists()
+    assert (tmp_path / "new.txt").read_text() == "data"
+    assert "Renamed to: new.txt" in texts(message)
+    assert features._FILE_PENDING == {}
+
+
+def test_rename_rejects_invalid_name_and_cancel_clears_prompt(tmp_path, monkeypatch):
+    _authorize(monkeypatch)
+    source = tmp_path / "old.txt"
+    source.write_text("data")
+    message = FakeMessage()
+    run(features.show_files(message, tmp_path))
+    _file_callback(message, "fm_rename_0")
+
+    message.text = "bad/name"
+    assert run(features.handle_text(message)) is True
+
+    assert source.exists()
+    assert "Rename failed" in texts(message)[-1]
+    assert features._FILE_PENDING
+
+    callback = _file_callback(message, "fm_cancel")
+    assert callback.answers[-1]["text"] == "Cancelled"
+    assert features._FILE_PENDING == {}
+
+
+def test_mkdir_prompt_creates_folder(tmp_path, monkeypatch):
+    _authorize(monkeypatch)
+    message = FakeMessage()
+    run(features.show_files(message, tmp_path))
+
+    prompt = _file_callback(message, "fm_mkdir")
+    assert "Send a name for the new folder" in texts(prompt.message)[-1]
+
+    message.text = "Reports"
+    assert run(features.handle_text(message)) is True
+
+    assert (tmp_path / "Reports").is_dir()
+    assert any(text.startswith("Created folder:") for text in texts(message))
+    assert features._FILE_PENDING == {}
+
+
+def test_copy_file_to_destination_folder(tmp_path, monkeypatch):
+    _authorize(monkeypatch)
+    source = tmp_path / "note.txt"
+    source.write_text("hello")
+    destination = tmp_path / "backup"
+    destination.mkdir()
+    message = FakeMessage()
+    run(features.show_files(message, tmp_path))
+
+    prompt = _file_callback(message, "fm_copy_1")
+    assert "Send an existing destination folder for: note.txt" in texts(
+        prompt.message
+    )[-1]
+
+    message.text = str(destination)
+    assert run(features.handle_text(message)) is True
+
+    assert source.read_text() == "hello"
+    assert (destination / "note.txt").read_text() == "hello"
+    copied = f"Copied to: {destination / 'note.txt'}"
+    assert copied in texts(message)
+    assert features._FILE_PENDING == {}
+
+
+def test_move_folder_to_destination_folder(tmp_path, monkeypatch):
+    _authorize(monkeypatch)
+    source = tmp_path / "docs"
+    source.mkdir()
+    (source / "a.txt").write_text("x")
+    destination = tmp_path / "archive"
+    destination.mkdir()
+    message = FakeMessage()
+    run(features.show_files(message, tmp_path))
+
+    # Entries are folders first: archive (0), docs (1).
+    _file_callback(message, "fm_move_1")
+    message.text = str(destination)
+    assert run(features.handle_text(message)) is True
+
+    assert not source.exists()
+    assert (destination / "docs" / "a.txt").read_text() == "x"
+    assert f"Moved to: {destination / 'docs'}" in texts(message)
+
+
+def test_delete_needs_confirmation_and_can_be_cancelled(tmp_path, monkeypatch):
+    _authorize(monkeypatch)
+    target = tmp_path / "old.txt"
+    target.write_text("x")
+    message = FakeMessage()
+    run(features.show_files(message, tmp_path))
+
+    confirm = _file_callback(message, "fm_delete_0")
+    body = texts(confirm.message)[-1]
+    assert "=== DELETE ===" in body
+    assert "This cannot be undone." in body
+    assert button_datas(confirm.message.sent[-1]["reply_markup"]) == [
+        "fm_del_yes",
+        "fm_del_no",
+    ]
+    assert target.exists()
+
+    cancelled = _file_callback(message, "fm_del_no")
+    assert cancelled.answers[-1]["text"] == "Deletion cancelled"
+    assert target.exists()
+    assert features._FILE_PENDING == {}
+
+    _file_callback(message, "fm_delete_0")
+    done = _file_callback(message, "fm_del_yes")
+    assert not target.exists()
+    assert texts(done.message)[0].startswith(f"Deleted: {target}")
+    assert features._FILE_PENDING == {}
+
+
+def test_file_prompt_accepts_empty_text_and_expires(tmp_path, monkeypatch):
+    _authorize(monkeypatch)
+    source = tmp_path / "old.txt"
+    source.write_text("data")
+    message = FakeMessage()
+    run(features.show_files(message, tmp_path))
+    _file_callback(message, "fm_rename_0")
+
+    message.text = "   "
+    assert run(features.handle_text(message)) is True
+    assert "Nothing was sent" in texts(message)[-1]
+    assert features._FILE_PENDING
+
+    features._FILE_PENDING[message.chat.id]["expiry"] = 0.0
+    message.text = "new.txt"
+    assert run(features.handle_text(message)) is False
+    assert features._FILE_PENDING == {}
+    assert source.exists()
 
 
 # --- Uploads ---------------------------------------------------------------
@@ -451,6 +680,173 @@ def test_network_screen_without_vpn(monkeypatch):
     assert "VPN: not detected" in body
     assert "No active network interfaces." in body
     assert "Public IP: unavailable" in body
+
+
+def test_net_menu_returns_to_status(monkeypatch):
+    monkeypatch.setattr(
+        features,
+        "collect_network_status",
+        lambda: {
+            "hostname": "PC",
+            "active": [],
+            "vpn_active": [],
+            "wifi": None,
+            "public_ip": None,
+        },
+    )
+    callback = FakeCallback()
+
+    run(features.handle_callback(callback, "net_menu"))
+
+    assert "=== NETWORK / VPN ===" in texts(callback.message)[-1]
+
+
+def test_lan_diagnostics_screen_displays_ping_and_dns(monkeypatch):
+    monkeypatch.setattr(
+        features,
+        "collect_lan_diagnostics",
+        lambda: {
+            "gateway": "192.168.1.1",
+            "gateway_ping": {"avg_ms": 1, "loss_percent": 0},
+            "internet_ping": {"avg_ms": 12.5, "loss_percent": 0},
+            "dns_servers": ["1.1.1.1", "8.8.8.8"],
+            "lookups": [
+                {
+                    "host": "example.com",
+                    "ok": True,
+                    "address": "93.184.216.34",
+                    "seconds": 0.012,
+                },
+                {"host": "broken.invalid", "ok": False},
+            ],
+        },
+    )
+    callback = FakeCallback()
+
+    run(features.handle_callback(callback, "net_lan"))
+
+    body = texts(callback.message)[-1]
+    assert "=== LAN DIAGNOSTICS ===" in body
+    assert "Gateway: 192.168.1.1" in body
+    assert "  Ping: 1 ms, 0% loss" in body
+    assert "Internet: 12.5 ms, 0% loss (1.1.1.1)" in body
+    assert "DNS servers: 1.1.1.1, 8.8.8.8" in body
+    assert "example.com -> 93.184.216.34 (12 ms)" in body
+    assert "broken.invalid -> failed" in body
+    datas = button_datas(callback.message.sent[-1]["reply_markup"])
+    assert {"net_lan", "net_speed", "net_menu"}.issubset(datas)
+
+
+def test_lan_diagnostics_failure_is_reported(monkeypatch):
+    def boom():
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(features, "collect_lan_diagnostics", boom)
+    callback = FakeCallback()
+
+    run(features.handle_callback(callback, "net_lan"))
+
+    assert texts(callback.message)[-1] == "LAN diagnostics failed: network down"
+    datas = button_datas(callback.message.sent[-1]["reply_markup"])
+    assert datas[0] == "net_menu"
+
+
+def test_speedtest_screen_shows_rates_and_latency(monkeypatch):
+    monkeypatch.setattr(
+        features,
+        "run_speedtest",
+        lambda: {
+            "server": "Cloudflare",
+            "download_mbps": 94.25,
+            "download_bytes": 118_000_000,
+            "download_seconds": 10.0,
+            "upload_mbps": 12.34,
+            "upload_bytes": 12_000_000,
+            "upload_seconds": 8.0,
+            "errors": [],
+        },
+    )
+    monkeypatch.setattr(
+        features, "ping_host", lambda *a, **k: {"avg_ms": 9, "loss_percent": 0}
+    )
+    callback = FakeCallback()
+
+    run(features.handle_callback(callback, "net_speed"))
+
+    sent = texts(callback.message)
+    assert sent[0] == "Running speed test (up to ~20 seconds)..."
+    body = sent[-1]
+    assert "=== SPEED TEST ===" in body
+    assert "Download: 94.2 Mbps (118.0 MB in 10.0 s)" in body
+    assert "Upload: 12.3 Mbps (12.0 MB in 8.0 s)" in body
+    assert "Latency: 9 ms, 0% loss" in body
+    datas = button_datas(callback.message.sent[-1]["reply_markup"])
+    assert {"net_speed", "net_menu"}.issubset(datas)
+
+
+def test_speedtest_failure_is_reported(monkeypatch):
+    def boom():
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr(features, "run_speedtest", boom)
+    monkeypatch.setattr(
+        features, "ping_host", lambda *a, **k: {"avg_ms": None, "loss_percent": 100}
+    )
+    callback = FakeCallback()
+
+    run(features.handle_callback(callback, "net_speed"))
+
+    assert "Speed test failed: offline" in texts(callback.message)[-1]
+
+
+def test_traceroute_screen_shows_hops_and_missing_replies(monkeypatch):
+    monkeypatch.setattr(
+        features,
+        "traceroute",
+        lambda host: [
+            {"hop": 1, "address": "192.168.1.1", "ms": 2.0},
+            {"hop": 2, "address": None, "ms": None},
+        ],
+    )
+    callback = FakeCallback()
+
+    run(features.handle_callback(callback, "net_route"))
+
+    sent = texts(callback.message)
+    assert sent[0] == "Tracing route to 1.1.1.1..."
+    body = sent[-1]
+    assert "=== TRACEROUTE ===" in body
+    assert "Target: 1.1.1.1" in body
+    assert "1  192.168.1.1" in body
+    assert "2.0 ms" in body
+    assert "no reply" in body
+
+
+def test_traceroute_empty_and_failure_are_reported(monkeypatch):
+    monkeypatch.setattr(features, "traceroute", lambda host: [])
+    callback = FakeCallback()
+    run(features.handle_callback(callback, "net_route"))
+    assert "No hops returned" in texts(callback.message)[-1]
+
+    def boom(host):
+        raise RuntimeError("blocked")
+
+    monkeypatch.setattr(features, "traceroute", boom)
+    callback = FakeCallback()
+    run(features.handle_callback(callback, "net_route"))
+    assert "Traceroute failed: blocked" in texts(callback.message)[-1]
+
+
+def test_network_unknown_action_is_rejected():
+    callback = FakeCallback()
+
+    run(features.handle_callback(callback, "net_bogus"))
+
+    assert callback.answers[-1] == {
+        "text": "Unknown network action",
+        "show_alert": True,
+    }
+    assert callback.message.sent == []
 
 
 # --- Scheduler -------------------------------------------------------------

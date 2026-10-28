@@ -90,6 +90,8 @@ def register_init_callbacks(dispatcher: Dispatcher) -> None:
                 clipboard_ui.cancel_pending(chat_id)
             if data not in ("fm_search", "fm_search_cancel"):
                 features.cancel_search_pending(chat_id)
+            if data not in ("fm_del_yes", "fm_del_no"):
+                features.cancel_file_pending(chat_id)
 
         # Per-application launch buttons use index-based callback data
         # (app_<idx>), keeping 64-byte limits and injection concerns away
@@ -787,11 +789,179 @@ CHART_RANGES = {
     "24h": "last 24 hours",
 }
 
+# Per-chat drive lists for the disk chart picker. The list is rebuilt from the
+# database and the live drive table every time the picker is opened.
+_CHART_DRIVES: dict = {}
+
+
+def _disk_drives() -> list:
+    """Return known drive identifiers, merging history with live drives."""
+    from config import config
+    from database import Database
+    from file_manager import list_drives
+
+    drives: list = []
+    seen: set = set()
+
+    def add(name) -> None:
+        text = str(name or "").strip()
+        if not text:
+            return
+        key = os.path.normcase(text.rstrip("\\/"))
+        if key in seen:
+            return
+        seen.add(key)
+        drives.append(text)
+
+    db_path = config["DATA_DIR"] / "pc_remote.db"
+    try:
+        db = Database(db_path)
+        try:
+            for device in db.get_disk_devices():
+                add(device)
+        finally:
+            db.close()
+    except Exception:
+        pass
+
+    try:
+        for item in list_drives():
+            add(item.get("name") or item.get("path"))
+    except Exception:
+        pass
+
+    return drives
+
+
+async def _show_disk_picker(
+    message: types.Message, time_range: str = "5m"
+) -> None:
+    """Show a per-drive picker for disk charts."""
+    try:
+        drives = await asyncio.to_thread(_disk_drives)
+    except Exception:
+        drives = []
+    _CHART_DRIVES[message.chat.id] = drives
+
+    if not drives:
+        await message.answer(
+            "No drives found yet. Disk history appears after the monitor "
+            "records its first sample.",
+            reply_markup=_charts_keyboard(),
+        )
+        return
+
+    lines = [
+        "=== DISK CHART ===",
+        "",
+        "Choose a drive and time range.",
+    ]
+    if time_range in CHART_RANGES:
+        lines.append(f"Suggested range: {CHART_RANGES[time_range]}.")
+
+    rows: list = []
+    for index, drive in enumerate(drives):
+        label = drive.rstrip("\\/") or drive
+        rows.append([
+            types.InlineKeyboardButton(
+                text=f"{label} {range_label}",
+                callback_data=f"chart_diskd_{index}_{range_key}",
+            )
+            for range_key, range_label in CHART_RANGES.items()
+        ])
+    rows.append([
+        types.InlineKeyboardButton(text="<< Charts", callback_data="chart_menu"),
+    ])
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+async def _send_chart(
+    message: types.Message,
+    metric: str,
+    time_range: str,
+    device_id: str = None,
+) -> None:
+    """Render and send one chart, including the disk drive name."""
+    from charts import render_chart
+    from config import config
+
+    db_path = config["DATA_DIR"] / "pc_remote.db"
+
+    try:
+        await message.bot.send_chat_action(message.chat.id, "upload_photo")
+    except Exception:
+        pass
+
+    # Chart rendering is CPU-bound and creates its own DB connection, so it
+    # must stay off the event loop.
+    image = await asyncio.to_thread(
+        render_chart, db_path, metric, time_range, device_id
+    )
+
+    if not image:
+        target = f" {device_id}" if device_id else ""
+        await message.answer(
+            f"No {CHART_METRICS[metric]}{target} history for the "
+            f"{CHART_RANGES[time_range]} yet.\n"
+            "History is recorded in the background; try again in a minute.",
+            reply_markup=_charts_keyboard(),
+        )
+        return
+
+    photo = types.BufferedInputFile(
+        image, filename=f"{metric}_{time_range}.png"
+    )
+    target = f" {device_id}" if device_id else ""
+    caption = (
+        f"{CHART_METRICS[metric]}{target} chart - "
+        f"{CHART_RANGES[time_range]}"
+    )
+    try:
+        await message.answer_photo(
+            photo=photo, caption=caption, reply_markup=_charts_keyboard()
+        )
+    except Exception as e:
+        await message.answer(
+            f"Failed to send chart: {md_safe(e)}",
+            reply_markup=_charts_keyboard(),
+        )
+
+
+async def _show_disk_chart(message: types.Message, selection: str) -> None:
+    """Handle ``diskd_<index>_<range>`` from the disk drive picker."""
+    rest = selection[len("diskd_"):]
+    index_text, _, time_range = rest.partition("_")
+    drives = _CHART_DRIVES.get(message.chat.id) or []
+    if (
+        not index_text.isdigit()
+        or time_range not in CHART_RANGES
+        or int(index_text) >= len(drives)
+    ):
+        await message.answer(
+            "Drive selection expired. Choose a drive again.",
+            reply_markup=_charts_keyboard(),
+        )
+        return
+    await _send_chart(
+        message, "disk", time_range, device_id=drives[int(index_text)]
+    )
+
 
 def _charts_keyboard() -> types.InlineKeyboardMarkup:
     """Build the chart menu keyboard (metric rows x time ranges)."""
     rows = []
     for metric, label in CHART_METRICS.items():
+        if metric == "disk":
+            rows.append([
+                types.InlineKeyboardButton(
+                    text="Disk: choose drive",
+                    callback_data="chart_disk",
+                )
+            ])
+            continue
         rows.append([
             types.InlineKeyboardButton(
                 text=f"{label} {range_label}",
@@ -811,6 +981,7 @@ async def show_chart_menu(message: types.Message) -> None:
         "=== CHARTS ===",
         "",
         "Select a metric and time range.",
+        "Disk charts ask for a drive first, so C: and D: stay separate.",
         "Charts are generated from stored measurements; right after startup",
         "the history may still be empty.",
     ]
@@ -827,6 +998,14 @@ async def show_chart(message: types.Message, selection: str) -> None:
         await show_chart_menu(message)
         return
 
+    if selection == "disk":
+        await _show_disk_picker(message)
+        return
+
+    if selection.startswith("diskd_"):
+        await _show_disk_chart(message, selection)
+        return
+
     metric, _, time_range = selection.partition("_")
     if metric not in CHART_METRICS or time_range not in CHART_RANGES:
         await message.answer(
@@ -835,46 +1014,11 @@ async def show_chart(message: types.Message, selection: str) -> None:
         )
         return
 
-    from charts import render_chart
-    from config import config
-
-    db_path = config["DATA_DIR"] / "pc_remote.db"
-
-    try:
-        await message.bot.send_chat_action(message.chat.id, "upload_photo")
-    except Exception:
-        pass
-
-    # Chart rendering is CPU-bound and creates its own DB connection, so it
-    # must stay off the event loop.
-    image = await asyncio.to_thread(
-        render_chart, db_path, metric, time_range
-    )
-
-    if not image:
-        await message.answer(
-            f"No {CHART_METRICS[metric]} history for the "
-            f"{CHART_RANGES[time_range]} yet.\n"
-            "History is recorded in the background; try again in a minute.",
-            reply_markup=_charts_keyboard(),
-        )
+    if metric == "disk":
+        await _show_disk_picker(message, time_range)
         return
 
-    photo = types.BufferedInputFile(
-        image, filename=f"{metric}_{time_range}.png"
-    )
-    caption = (
-        f"{CHART_METRICS[metric]} chart - {CHART_RANGES[time_range]}"
-    )
-    try:
-        await message.answer_photo(
-            photo=photo, caption=caption, reply_markup=_charts_keyboard()
-        )
-    except Exception as e:
-        await message.answer(
-            f"Failed to send chart: {md_safe(e)}",
-            reply_markup=_charts_keyboard(),
-        )
+    await _send_chart(message, metric, time_range)
 
 
 async def show_alerts_history(message: types.Message) -> None:

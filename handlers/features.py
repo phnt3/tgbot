@@ -33,14 +33,27 @@ from disk_cleanup import (
 )
 from file_manager import (
     MAX_SEND_BYTES,
+    copy_path,
     default_upload_dir,
+    delete_path,
     format_size,
     list_directory,
+    list_drives,
+    make_directory,
+    move_path,
+    rename_path,
     save_upload,
     search_files,
+    validate_name,
 )
 from media_control import MEDIA_ACTIONS, press_key
-from network_info import collect_network_status
+from network_info import (
+    collect_lan_diagnostics,
+    collect_network_status,
+    ping_host,
+    run_speedtest,
+    traceroute,
+)
 from scheduler import TaskScheduler, describe_task
 
 logger = logging.getLogger(__name__)
@@ -55,6 +68,9 @@ RECYCLE_CONFIRM_KEY = "recycle_bin"
 _FILE_STATE: Dict[int, Dict[str, Any]] = {}
 _SEARCH_STATE: Dict[int, Dict[str, Any]] = {}
 _SEARCH_PENDING: Dict[int, Dict[str, Any]] = {}
+_FILE_PENDING: Dict[int, Dict[str, Any]] = {}
+
+FILE_PROMPT_TTL_SECONDS = 300
 _scheduler: Optional[TaskScheduler] = None
 
 
@@ -305,11 +321,35 @@ async def confirm_empty_bin(message: types.Message) -> None:
 
 
 async def show_files(message: types.Message, path: Optional[Path] = None) -> None:
-    """Open the file browser at ``path`` (home folder by default)."""
+    """Open the file browser: a drive list, or ``path`` when given."""
     chat_id = _key(message)
     cancel_search_pending(chat_id)
+    cancel_file_pending(chat_id)
     _SEARCH_STATE.pop(chat_id, None)
-    await _load_directory(message, Path(path) if path else Path.home())
+    if path is None:
+        await _show_drives(message)
+    else:
+        await _load_directory(message, Path(path))
+
+
+async def _show_drives(message: types.Message, page: int = 0) -> None:
+    """List mounted drives as the browsing roots."""
+    try:
+        drives = await asyncio.to_thread(list_drives)
+    except Exception as e:
+        logger.exception("Drive listing failed")
+        await message.answer(f"Failed to list drives: {e}")
+        return
+
+    _FILE_STATE[_key(message)] = {
+        "mode": "drives",
+        "drives": drives,
+        "path": None,
+        "parent": None,
+        "entries": [],
+        "page": max(0, int(page)),
+    }
+    await _render_files(message)
 
 
 async def _load_directory(
@@ -327,9 +367,11 @@ async def _load_directory(
         return
 
     _FILE_STATE[_key(message)] = {
+        "mode": "dir",
         "path": listing["path"],
         "parent": listing["parent"],
         "entries": listing["entries"],
+        "drives": [],
         "page": max(0, int(page)),
         "error": None,
     }
@@ -337,13 +379,16 @@ async def _load_directory(
 
 
 async def _render_files(message: types.Message) -> None:
-    """Render the cached directory listing as one message with buttons."""
+    """Render the cached drive list or directory listing as one message."""
     state = _FILE_STATE.get(_key(message))
     if state is None:
         await message.answer("File browser expired. Open it again from /files.")
         return
+    if state.get("mode") == "drives":
+        await _render_drives(message, state)
+        return
 
-    entries: List[Dict[str, Any]] = state["entries"]
+    entries: List[Dict[str, Any]] = state.get("entries") or []
     page_count = max(1, (len(entries) + FILES_PER_PAGE - 1) // FILES_PER_PAGE)
     page = min(max(0, int(state["page"])), page_count - 1)
     state["page"] = page
@@ -372,20 +417,76 @@ async def _render_files(message: types.Message) -> None:
             data = f"fm_get_{index}"
         if len(label) > 55:
             label = label[:52] + "..."
-        rows.append([_button(label, data)])
+        rows.append([_button(label, data), _button("...", f"fm_act_{index}")])
 
     if page > 0:
         rows.append([_button("< Prev", f"fm_page_{page - 1}")])
     if page < page_count - 1:
         rows.append([_button("Next >", f"fm_page_{page + 1}")])
 
-    nav = [
-        _button("Home", "fm_home"),
+    rows.append([
+        _button("Search", "fm_search"),
+        _button("New folder", "fm_mkdir"),
+    ])
+    rows.append([
+        _button("Drives", "fm_drives"),
         _button("Up", "fm_up"),
         _button("Refresh", "fm_refresh"),
+    ])
+    rows.append([_button("<< Back", "menu_main")])
+
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=rows),
+        disable_web_page_preview=True,
+    )
+
+
+async def _render_drives(
+    message: types.Message, state: Dict[str, Any]
+) -> None:
+    """Render the drive picker with free-space details."""
+    drives: List[Dict[str, Any]] = state.get("drives") or []
+    page_count = max(1, (len(drives) + FILES_PER_PAGE - 1) // FILES_PER_PAGE)
+    page = min(max(0, int(state.get("page", 0))), page_count - 1)
+    state["page"] = page
+    start = page * FILES_PER_PAGE
+    visible = drives[start:start + FILES_PER_PAGE]
+
+    lines = [
+        "=== FILES: DRIVES ===",
+        "",
+        "Select a drive to browse. Use the \"...\" button next to any",
+        "entry for rename, copy, move and delete.",
     ]
-    rows.append([_button("Search this folder", "fm_search")])
-    rows.append(nav)
+    if not drives:
+        lines.append("No drives detected.")
+    else:
+        lines.append(f"Drives: {len(drives)}")
+
+    rows: List[List[types.InlineKeyboardButton]] = []
+    for offset, drive in enumerate(visible):
+        index = start + offset
+        name = str(drive.get("name") or drive.get("path") or "Drive")
+        total = int(drive.get("total") or 0)
+        free = int(drive.get("free") or 0)
+        if total:
+            label = (
+                f"{name}  {format_size(free)} free "
+                f"of {format_size(total)}"
+            )
+        else:
+            label = f"{name}  (size unavailable)"
+        if len(label) > 60:
+            label = label[:57] + "..."
+        rows.append([_button(label, f"fm_drive_{index}")])
+
+    if page > 0:
+        rows.append([_button("< Prev", f"fm_page_{page - 1}")])
+    if page < page_count - 1:
+        rows.append([_button("Next >", f"fm_page_{page + 1}")])
+
+    rows.append([_button("Refresh", "fm_refresh")])
     rows.append([_button("<< Back", "menu_main")])
 
     await message.answer(
@@ -421,6 +522,308 @@ def _parse_index(data: str, prefix: str) -> Optional[int]:
     if not raw.isdigit():
         return None
     return int(raw)
+
+
+# --- File operations -------------------------------------------------------
+
+
+def cancel_file_pending(chat_id: int) -> None:
+    """Cancel an armed file-operation prompt for this chat."""
+    _FILE_PENDING.pop(int(chat_id), None)
+
+
+def _prune_file_pending() -> None:
+    """Drop expired file-operation prompts."""
+    now = time.time()
+    for key, entry in list(_FILE_PENDING.items()):
+        if float(entry.get("expiry", 0)) < now:
+            _FILE_PENDING.pop(key, None)
+
+
+def _cancel_button_row() -> List[types.InlineKeyboardButton]:
+    return [_button("Cancel", "fm_cancel")]
+
+
+async def _show_file_actions(message: types.Message, index: int) -> None:
+    """Show the per-entry action menu for one cached folder entry."""
+    state = _FILE_STATE.get(_key(message))
+    if state is None or state.get("mode") != "dir":
+        await message.answer("File browser expired. Open it again from /files.")
+        return
+    entries: List[Dict[str, Any]] = state.get("entries") or []
+    if not 0 <= index < len(entries):
+        await message.answer("That entry is gone. Refresh the folder.")
+        return
+
+    entry = entries[index]
+    kind = "folder" if entry["is_dir"] else "file"
+    lines = [
+        "=== FILE ACTIONS ===",
+        "",
+        f"Selected {kind}: {entry['name']}",
+        f"Path: {entry['path']}",
+        "",
+        "Choose an operation.",
+    ]
+    rows: List[List[types.InlineKeyboardButton]] = []
+    if not entry["is_dir"]:
+        rows.append([_button("Download", f"fm_get_{index}")])
+    rows.append([
+        _button("Rename", f"fm_rename_{index}"),
+        _button("Copy", f"fm_copy_{index}"),
+    ])
+    rows.append([
+        _button("Move", f"fm_move_{index}"),
+        _button("Delete", f"fm_delete_{index}"),
+    ])
+    rows.append(_cancel_button_row())
+
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=rows),
+        disable_web_page_preview=True,
+    )
+
+
+async def _start_file_prompt(
+    message: types.Message,
+    action: str,
+    *,
+    path: Optional[Path] = None,
+    base: Optional[Path] = None,
+) -> None:
+    """Arm a one-shot text prompt for a file operation."""
+    chat_id = _key(message)
+    cancel_search_pending(chat_id)
+    _prune_file_pending()
+    _FILE_PENDING[chat_id] = {
+        "action": action,
+        "path": str(path) if path is not None else None,
+        "base": str(base) if base is not None else None,
+        "expiry": time.time() + FILE_PROMPT_TTL_SECONDS,
+    }
+
+    target = Path(path).name if path is not None else str(base or "")
+    prompts = {
+        "rename": f"Send a new name for: {target}",
+        "move": (
+            f"Send an existing destination folder for: {target}\n"
+            "Example: D:\\Backup"
+        ),
+        "copy": (
+            f"Send an existing destination folder for: {target}\n"
+            "Example: D:\\Backup"
+        ),
+        "mkdir": f"Send a name for the new folder in: {base}",
+    }
+    lines = [
+        "=== FILE OPERATION ===",
+        "",
+        prompts.get(action, "Send a value."),
+    ]
+    if action != "mkdir":
+        lines += [
+            "",
+            "The item keeps its current name inside the destination folder.",
+        ]
+    lines += [
+        "",
+        f"This prompt expires in {FILE_PROMPT_TTL_SECONDS // 60} min.",
+    ]
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=types.InlineKeyboardMarkup(
+            inline_keyboard=[_cancel_button_row()]
+        ),
+        disable_web_page_preview=True,
+    )
+
+
+async def _retry_file_prompt(
+    message: types.Message, entry: Dict[str, Any], note: str
+) -> None:
+    """Keep an armed prompt alive when the user supplied a bad value."""
+    entry["expiry"] = time.time() + FILE_PROMPT_TTL_SECONDS
+    await message.answer(
+        f"{note}\nTry again or press Cancel.",
+        reply_markup=types.InlineKeyboardMarkup(
+            inline_keyboard=[_cancel_button_row()]
+        ),
+    )
+
+
+async def _confirm_delete(message: types.Message, index: int) -> None:
+    """Ask for an explicit confirmation before deleting one entry."""
+    chat_id = _key(message)
+    state = _FILE_STATE.get(chat_id)
+    if state is None or state.get("mode") != "dir":
+        await message.answer("File browser expired. Open it again from /files.")
+        return
+    entries: List[Dict[str, Any]] = state.get("entries") or []
+    if not 0 <= index < len(entries):
+        await message.answer("That entry is gone. Refresh the folder.")
+        return
+
+    entry = entries[index]
+    cancel_search_pending(chat_id)
+    _prune_file_pending()
+    _FILE_PENDING[chat_id] = {
+        "action": "delete",
+        "path": str(entry["path"]),
+        "base": str(state["path"]),
+        "expiry": time.time() + FILE_PROMPT_TTL_SECONDS,
+    }
+    kind = "folder and everything inside it" if entry["is_dir"] else "file"
+    lines = [
+        "=== DELETE ===",
+        "",
+        f"Delete this {kind}?",
+        str(entry["path"]),
+        "",
+        "This cannot be undone.",
+    ]
+    rows = [[
+        _button("Yes, delete", "fm_del_yes"),
+        _button("Cancel", "fm_del_no"),
+    ]]
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=rows),
+        disable_web_page_preview=True,
+    )
+
+
+async def _run_delete(message: types.Message) -> None:
+    """Execute the delete operation stored by ``_confirm_delete``."""
+    chat_id = _key(message)
+    _prune_file_pending()
+    entry = _FILE_PENDING.pop(chat_id, None)
+    if entry is None or entry.get("action") != "delete":
+        await message.answer("Delete confirmation expired. Select the entry again.")
+        return
+
+    path = Path(str(entry.get("path")))
+    base = Path(str(entry["base"])) if entry.get("base") else None
+    try:
+        stats = await asyncio.to_thread(delete_path, path)
+    except Exception as e:
+        logger.exception("Delete failed")
+        await message.answer(f"Delete failed: {e}")
+        if base is not None:
+            await _load_directory(message, base)
+        return
+
+    text = f"Deleted: {path}"
+    if stats.get("bytes"):
+        text += f" ({format_size(stats['bytes'])})"
+    if stats.get("errors"):
+        text += f"\n{stats['errors']} item(s) could not be removed."
+    await message.answer(text)
+    if base is not None:
+        await _load_directory(message, base)
+
+
+async def _handle_file_text(
+    message: types.Message, chat_id: int, entry: Dict[str, Any]
+) -> bool:
+    """Apply the armed file operation to one plain-text message."""
+    text = str(getattr(message, "text", "") or "").strip()
+    action = str(entry.get("action") or "")
+    base = Path(str(entry["base"])) if entry.get("base") else None
+
+    if not text:
+        entry["expiry"] = time.time() + FILE_PROMPT_TTL_SECONDS
+        await message.answer(
+            "Nothing was sent. Send a value or press Cancel.",
+            reply_markup=types.InlineKeyboardMarkup(
+                inline_keyboard=[_cancel_button_row()]
+            ),
+        )
+        return True
+
+    if action == "rename":
+        try:
+            target = await asyncio.to_thread(
+                rename_path, Path(str(entry.get("path"))), text
+            )
+        except (ValueError, FileExistsError) as e:
+            await _retry_file_prompt(message, entry, f"Rename failed: {e}")
+            return True
+        except Exception as e:
+            logger.exception("Rename failed")
+            _FILE_PENDING.pop(chat_id, None)
+            await message.answer(f"Rename failed: {e}")
+            if base is not None:
+                await _load_directory(message, base)
+            return True
+        _FILE_PENDING.pop(chat_id, None)
+        await message.answer(f"Renamed to: {target.name}")
+        if base is not None:
+            await _load_directory(message, base)
+        return True
+
+    if action in ("move", "copy"):
+        raw = text.strip().strip('"').strip("'")
+        destination = Path(raw)
+        try:
+            exists = await asyncio.to_thread(destination.is_dir)
+        except OSError:
+            exists = False
+        if not exists:
+            await _retry_file_prompt(
+                message, entry, f"Destination folder not found: {raw}"
+            )
+            return True
+
+        operation = move_path if action == "move" else copy_path
+        try:
+            target = await asyncio.to_thread(
+                operation, Path(str(entry.get("path"))), destination
+            )
+        except (ValueError, FileExistsError, NotADirectoryError) as e:
+            await _retry_file_prompt(
+                message, entry, f"{action.capitalize()} failed: {e}"
+            )
+            return True
+        except Exception as e:
+            logger.exception("File %s failed", action)
+            _FILE_PENDING.pop(chat_id, None)
+            await message.answer(f"{action.capitalize()} failed: {e}")
+            if base is not None:
+                await _load_directory(message, base)
+            return True
+
+        _FILE_PENDING.pop(chat_id, None)
+        await message.answer(
+            f"{'Moved' if action == 'move' else 'Copied'} to: {target}"
+        )
+        if base is not None:
+            await _load_directory(message, base)
+        return True
+
+    if action == "mkdir":
+        if base is None:
+            _FILE_PENDING.pop(chat_id, None)
+            await message.answer("Folder expired. Open Files again.")
+            return True
+        try:
+            target = await asyncio.to_thread(make_directory, base, text)
+        except (ValueError, FileExistsError) as e:
+            await _retry_file_prompt(message, entry, f"Create folder failed: {e}")
+            return True
+        except Exception as e:
+            logger.exception("Create folder failed")
+            _FILE_PENDING.pop(chat_id, None)
+            await message.answer(f"Create folder failed: {e}")
+            await _load_directory(message, base)
+            return True
+        _FILE_PENDING.pop(chat_id, None)
+        await message.answer(f"Created folder: {target}")
+        await _load_directory(message, base)
+        return True
+
+    _FILE_PENDING.pop(chat_id, None)
+    return False
 
 
 # --- File search -----------------------------------------------------------
@@ -528,9 +931,9 @@ async def _render_search(message: types.Message) -> None:
 
 
 async def handle_text(message: types.Message, state: Any = None) -> bool:
-    """Run a search for the next plain-text message when a prompt is armed.
+    """Handle the next plain-text message when a search/file prompt is armed.
 
-    Returns ``True`` when the message belonged to a search prompt.
+    Returns ``True`` when the message belonged to one of these prompts.
     """
     from security import is_user_authorized
 
@@ -540,6 +943,14 @@ async def handle_text(message: types.Message, state: Any = None) -> bool:
 
     chat_id = _key(message)
     _prune_search_pending()
+    _prune_file_pending()
+    file_entry = _FILE_PENDING.get(chat_id)
+    if file_entry is not None:
+        if str(file_entry.get("action") or "") == "delete":
+            # Delete uses inline confirmation, so free text is not an answer.
+            _FILE_PENDING.pop(chat_id, None)
+        else:
+            return await _handle_file_text(message, chat_id, file_entry)
     entry = _SEARCH_PENDING.get(chat_id)
     if entry is None:
         return False
@@ -557,7 +968,11 @@ async def handle_text(message: types.Message, state: Any = None) -> bool:
         return True
 
     _SEARCH_PENDING.pop(chat_id, None)
-    root = Path(str(entry.get("root") or Path.home()))
+    root_raw = entry.get("root")
+    if not root_raw:
+        await message.answer("Search folder expired. Open Files and search again.")
+        return True
+    root = Path(str(root_raw))
     try:
         found = await asyncio.to_thread(search_files, root, text)
     except ValueError as e:
@@ -587,24 +1002,50 @@ async def _handle_file_callback(callback: types.CallbackQuery, data: str) -> Non
         await callback.answer("Message is no longer available", show_alert=True)
         return
 
-    if data == "fm_home":
+    if data in ("fm_home", "fm_drives"):
         await show_files(message)
         return
     if data == "fm_noop":
         await callback.answer()
         return
 
+    if data == "fm_del_yes":
+        await callback.answer("Deleting...")
+        await _run_delete(message)
+        return
+    if data == "fm_del_no":
+        cancel_file_pending(_key(message))
+        await callback.answer("Deletion cancelled")
+        state = _FILE_STATE.get(_key(message))
+        if state is not None and state.get("mode") == "dir":
+            await _load_directory(
+                message, Path(state["path"]), int(state.get("page", 0))
+            )
+        return
+    if data == "fm_cancel":
+        chat_id = _key(message)
+        cancel_file_pending(chat_id)
+        cancel_search_pending(chat_id)
+        await callback.answer("Cancelled")
+        state = _FILE_STATE.get(chat_id)
+        if state is not None and state.get("mode") == "dir":
+            await _load_directory(
+                message, Path(state["path"]), int(state.get("page", 0))
+            )
+        else:
+            await show_files(message)
+        return
+
     search_state = _SEARCH_STATE.get(_key(message))
 
     if data == "fm_search":
         file_state = _FILE_STATE.get(_key(message))
-        if file_state is not None:
+        if file_state is not None and file_state.get("mode") == "dir":
             root = Path(file_state["path"])
         elif search_state is not None:
             root = Path(search_state["root"])
         else:
-            await callback.answer("File browser expired", show_alert=True)
-            await show_files(message)
+            await callback.answer("Open a folder first", show_alert=True)
             return
         await _start_search_prompt(message, root)
         return
@@ -614,7 +1055,7 @@ async def _handle_file_callback(callback: types.CallbackQuery, data: str) -> Non
         cancel_search_pending(chat_id)
         await callback.answer("Search cancelled")
         file_state = _FILE_STATE.get(chat_id)
-        if file_state is not None:
+        if file_state is not None and file_state.get("mode") == "dir":
             await _load_directory(message, Path(file_state["path"]))
         else:
             await show_files(message)
@@ -626,7 +1067,7 @@ async def _handle_file_callback(callback: types.CallbackQuery, data: str) -> Non
             await _load_directory(message, Path(search_state["root"]))
             return
         file_state = _FILE_STATE.get(_key(message))
-        if file_state is not None:
+        if file_state is not None and file_state.get("mode") == "dir":
             await _load_directory(message, Path(file_state["path"]))
         else:
             await show_files(message)
@@ -667,13 +1108,21 @@ async def _handle_file_callback(callback: types.CallbackQuery, data: str) -> Non
         return
 
     if data == "fm_refresh":
-        await _load_directory(message, Path(state["path"]), int(state["page"]))
+        if state.get("mode") == "drives":
+            await _show_drives(message, int(state.get("page", 0)))
+        else:
+            await _load_directory(
+                message, Path(state["path"]), int(state.get("page", 0))
+            )
         return
 
     if data == "fm_up":
+        if state.get("mode") == "drives":
+            await callback.answer("Select a drive to browse", show_alert=True)
+            return
         parent = state.get("parent")
         if parent is None:
-            await callback.answer("Already at the top", show_alert=True)
+            await _show_drives(message)
             return
         await _load_directory(message, Path(parent))
         return
@@ -687,13 +1136,78 @@ async def _handle_file_callback(callback: types.CallbackQuery, data: str) -> Non
         await _render_files(message)
         return
 
+    if data.startswith("fm_drive_"):
+        index = _parse_index(data, "fm_drive_")
+        drives: List[Dict[str, Any]] = state.get("drives") or []
+        if (
+            state.get("mode") != "drives"
+            or index is None
+            or not 0 <= index < len(drives)
+        ):
+            await callback.answer("Drive is gone; refreshing", show_alert=True)
+            await _show_drives(message)
+            return
+        await _load_directory(message, Path(drives[index]["path"]))
+        return
+
+    if state.get("mode") != "dir":
+        await callback.answer("Open a folder first", show_alert=True)
+        return
+
+    if data.startswith("fm_act_"):
+        index = _parse_index(data, "fm_act_")
+        if index is None:
+            await callback.answer("Invalid entry", show_alert=True)
+            return
+        await callback.answer()
+        await _show_file_actions(message, index)
+        return
+
+    if data == "fm_mkdir":
+        await callback.answer()
+        await _start_file_prompt(
+            message, "mkdir", base=Path(state["path"])
+        )
+        return
+
+    for prefix, action in (
+        ("fm_rename_", "rename"),
+        ("fm_move_", "move"),
+        ("fm_copy_", "copy"),
+        ("fm_delete_", "delete"),
+    ):
+        if not data.startswith(prefix):
+            continue
+        index = _parse_index(data, prefix)
+        entries: List[Dict[str, Any]] = state.get("entries") or []
+        if index is None or not 0 <= index < len(entries):
+            await callback.answer("Entry is gone; refreshing", show_alert=True)
+            await _load_directory(
+                message, Path(state["path"]), int(state.get("page", 0))
+            )
+            return
+        entry = entries[index]
+        await callback.answer()
+        if action == "delete":
+            await _confirm_delete(message, index)
+        else:
+            await _start_file_prompt(
+                message,
+                action,
+                path=Path(entry["path"]),
+                base=Path(state["path"]),
+            )
+        return
+
     if data.startswith("fm_open_") or data.startswith("fm_get_"):
         want_file = data.startswith("fm_get_")
         index = _parse_index(data, "fm_get_" if want_file else "fm_open_")
-        entries: List[Dict[str, Any]] = state["entries"]
+        entries = state.get("entries") or []
         if index is None or not 0 <= index < len(entries):
             await callback.answer("Entry is gone; refreshing", show_alert=True)
-            await _load_directory(message, Path(state["path"]), int(state["page"]))
+            await _load_directory(
+                message, Path(state["path"]), int(state.get("page", 0))
+            )
             return
 
         entry = entries[index]
@@ -907,23 +1421,218 @@ async def show_network(message: types.Message) -> None:
     public_ip = status.get("public_ip")
     lines += ["", f"Public IP: {md_safe(public_ip) if public_ip else 'unavailable'}"]
 
-    keyboard = _back_keyboard([[_button("Refresh", "net_refresh")]])
+    keyboard = _back_keyboard([
+        [
+            _button("LAN diagnostics", "net_lan"),
+            _button("Speed test", "net_speed"),
+        ],
+        [_button("Traceroute", "net_route")],
+        [_button("Refresh", "net_refresh")],
+    ])
     await message.answer(
         "\n".join(lines), reply_markup=keyboard, disable_web_page_preview=True
+    )
+
+
+def _format_ping(ping: Optional[Dict[str, Any]]) -> str:
+    """Format one ping result for the diagnostics screen."""
+    if not ping:
+        return "unavailable"
+    loss = ping.get("loss_percent")
+    latency = ping.get("avg_ms")
+    if ping.get("error") and loss is None:
+        return f"failed ({md_safe(ping['error'])})"
+    if loss is None:
+        return "no reply"
+    if loss >= 100:
+        return "no reply (100% loss)"
+    text = f"{loss}% loss"
+    if latency is not None:
+        text = f"{latency} ms, {text}"
+    return text
+
+
+def _format_lan_diagnostics(status: Dict[str, Any]) -> str:
+    """Render LAN diagnostics as plain text."""
+    lines = ["=== LAN DIAGNOSTICS ===", ""]
+
+    gateway = status.get("gateway")
+    lines.append(f"Gateway: {gateway or 'not found'}")
+    if gateway:
+        lines.append(f"  Ping: {_format_ping(status.get('gateway_ping'))}")
+
+    lines += [
+        "",
+        f"Internet: {_format_ping(status.get('internet_ping'))} (1.1.1.1)",
+    ]
+
+    servers = status.get("dns_servers") or []
+    lines += [
+        "",
+        "DNS servers: " + (", ".join(servers) if servers else "not found"),
+    ]
+
+    lookups = status.get("lookups") or []
+    if lookups:
+        lines.append("DNS lookups:")
+        for item in lookups:
+            host = md_safe(str(item.get("host", "?")))
+            if item.get("ok") and item.get("address"):
+                result = f"{item['address']} ({round(float(item['seconds']) * 1000)} ms)"
+            else:
+                result = "failed"
+            lines.append(f"  {host} -> {result}")
+
+    return "\n".join(lines)
+
+
+async def _show_lan_diagnostics(message: types.Message) -> None:
+    """Run and display gateway, ping and DNS diagnostics."""
+    try:
+        status = await asyncio.to_thread(collect_lan_diagnostics)
+    except Exception as e:
+        logger.exception("LAN diagnostics failed")
+        await message.answer(
+            f"LAN diagnostics failed: {md_safe(e)}",
+            reply_markup=_back_keyboard([[_button("Back to network", "net_menu")]]),
+        )
+        return
+
+    keyboard = _back_keyboard([
+        [_button("Refresh", "net_lan")],
+        [_button("Speed test", "net_speed")],
+        [_button("Back to network", "net_menu")],
+    ])
+    await message.answer(
+        _format_lan_diagnostics(status),
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+
+
+def _format_speedtest(result: Dict[str, Any], ping: Dict[str, Any]) -> str:
+    """Render a speed test result as plain text."""
+    lines = ["=== SPEED TEST ===", "", f"Server: {result.get('server', 'unknown')}"]
+
+    for label, prefix in (("Download", "download"), ("Upload", "upload")):
+        mbps = result.get(f"{prefix}_mbps")
+        byte_count = int(result.get(f"{prefix}_bytes") or 0)
+        seconds = float(result.get(f"{prefix}_seconds") or 0)
+        speed = f"{mbps:.1f} Mbps" if mbps is not None else "failed"
+        transferred = f"{byte_count / 1_000_000:.1f} MB in {seconds:.1f} s"
+        lines.append(f"{label}: {speed} ({transferred})")
+
+    lines += [
+        "",
+        f"Latency: {_format_ping(ping)}",
+        "",
+        "Measured against Cloudflare; the result depends on the current",
+        "network, VPN and server load.",
+    ]
+
+    errors = result.get("errors") or []
+    if errors:
+        lines += ["", "Errors:"]
+        lines += [f"  {md_safe(str(error))}" for error in errors]
+
+    return "\n".join(lines)
+
+
+async def _show_speedtest(message: types.Message) -> None:
+    """Run a bounded download/upload speed test and show the result."""
+    keyboard = _back_keyboard([
+        [_button("Repeat test", "net_speed")],
+        [_button("Back to network", "net_menu")],
+    ])
+    await message.answer(
+        "Running speed test (up to ~20 seconds)...",
+        reply_markup=_back_keyboard([[_button("Back to network", "net_menu")]]),
+    )
+    try:
+        result, ping = await asyncio.gather(
+            asyncio.to_thread(run_speedtest),
+            asyncio.to_thread(ping_host, "1.1.1.1", 2, 800),
+        )
+    except Exception as e:
+        logger.exception("Speed test failed")
+        await message.answer(
+            f"Speed test failed: {md_safe(e)}", reply_markup=keyboard
+        )
+        return
+
+    await message.answer(
+        _format_speedtest(result, ping),
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+
+
+def _format_traceroute(host: str, hops: List[Dict[str, Any]]) -> str:
+    """Render traceroute hops as plain text."""
+    lines = ["=== TRACEROUTE ===", f"Target: {host}", ""]
+    if not hops:
+        lines.append("No hops returned. The route may be blocked by the network.")
+        return "\n".join(lines)
+
+    for hop in hops:
+        number = hop.get("hop", "?")
+        address = md_safe(str(hop.get("address") or "*"))
+        latency = hop.get("ms")
+        if latency is None:
+            lines.append(f"{number:>2}  {address:<16}  no reply")
+        else:
+            lines.append(f"{number:>2}  {address:<16}  {latency} ms")
+    return "\n".join(lines)
+
+
+async def _show_traceroute(message: types.Message) -> None:
+    """Run a bounded traceroute and show the route."""
+    host = "1.1.1.1"
+    keyboard = _back_keyboard([
+        [_button("Repeat", "net_route")],
+        [_button("Back to network", "net_menu")],
+    ])
+    await message.answer(
+        f"Tracing route to {host}...",
+        reply_markup=_back_keyboard([[_button("Back to network", "net_menu")]]),
+    )
+    try:
+        hops = await asyncio.to_thread(traceroute, host)
+    except Exception as e:
+        logger.exception("Traceroute failed")
+        await message.answer(
+            f"Traceroute failed: {md_safe(e)}", reply_markup=keyboard
+        )
+        return
+
+    await message.answer(
+        _format_traceroute(host, hops),
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
     )
 
 
 async def _handle_network_callback(
     callback: types.CallbackQuery, data: str
 ) -> None:
-    """Refresh the network status screen."""
-    if data != "net_refresh":
+    """Dispatch network status and diagnostic actions."""
+    if data not in {"net_refresh", "net_lan", "net_speed", "net_route", "net_menu"}:
         await callback.answer("Unknown network action", show_alert=True)
         return
     if callback.message is None:
         await callback.answer("Message is no longer available", show_alert=True)
         return
-    await show_network(callback.message)
+
+    await callback.answer()
+    message = callback.message
+    if data == "net_lan":
+        await _show_lan_diagnostics(message)
+    elif data == "net_speed":
+        await _show_speedtest(message)
+    elif data == "net_route":
+        await _show_traceroute(message)
+    else:
+        await show_network(message)
 
 
 # --- Task scheduler --------------------------------------------------------

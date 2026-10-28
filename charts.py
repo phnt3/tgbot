@@ -486,22 +486,28 @@ class Charts:
             return None
 
     def generate_chart(
-        self, metric: str, time_range: str = "5m"
+        self,
+        metric: str,
+        time_range: str = "5m",
+        device_id: Optional[str] = None,
     ) -> Optional[bytes]:
         """Generate a chart by metric name.
 
         Args:
             metric: "cpu", "gpu", "ram" or "disk".
             time_range: One of "5m", "1h", "24h".
+            device_id: Optional drive for disk charts (e.g. ``D:\\``).
 
         Returns:
             PNG bytes, or None if the metric is unknown or has no data.
         """
+        if metric == "disk":
+            return self.generate_disk_chart(time_range, device_id)
+
         generators = {
             "cpu": self.generate_cpu_chart,
             "gpu": self.generate_gpu_chart,
             "ram": self.generate_ram_chart,
-            "disk": self.generate_disk_chart,
         }
         generator = generators.get(metric)
         if generator is None:
@@ -555,7 +561,10 @@ class Charts:
 
 
 def render_chart(
-    db_path: Path, metric: str, time_range: str = "5m"
+    db_path: Path,
+    metric: str,
+    time_range: str = "5m",
+    device_id: Optional[str] = None,
 ) -> Optional[bytes]:
     """Render a chart with a short-lived database connection.
 
@@ -566,12 +575,13 @@ def render_chart(
         db_path: Path to the SQLite database.
         metric: "cpu", "gpu", "ram" or "disk".
         time_range: One of "5m", "1h", "24h".
+        device_id: Optional drive for disk charts (e.g. ``D:\\``).
 
     Returns:
         PNG bytes, or None if there is no data.
     """
     db = Database(Path(db_path))
     try:
-        return Charts(db).generate_chart(metric, time_range)
+        return Charts(db).generate_chart(metric, time_range, device_id)
     finally:
         db.close()

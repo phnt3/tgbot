@@ -609,6 +609,20 @@ class Database:
         except sqlite3.Error as e:
             raise RuntimeError(f"Failed to query disk history: {e}")
 
+    def get_disk_devices(self) -> List[str]:
+        """Return every drive identifier present in disk history."""
+        if self._conn is None:
+            raise RuntimeError("Database connection not established")
+        try:
+            cursor = self._conn.execute(
+                "SELECT DISTINCT device_id FROM disk_history "
+                "WHERE device_id IS NOT NULL AND device_id != '' "
+                "ORDER BY device_id"
+            )
+            return [str(row[0]) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            raise RuntimeError(f"Failed to query disk devices: {e}")
+
     def close(self) -> None:
         """Close the database connection."""
         if self._conn:

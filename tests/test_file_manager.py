@@ -4,14 +4,25 @@ All filesystem work happens inside ``tmp_path``; the 45 MB download cap is
 checked without allocating a large file.
 """
 
+import subprocess
+
+import pytest
+
 import file_manager
 from file_manager import (
+    copy_path,
+    delete_path,
     format_size,
     list_directory,
+    list_drives,
+    make_directory,
+    move_path,
     read_for_send,
+    rename_path,
     sanitize_filename,
     save_upload,
     search_files,
+    validate_name,
 )
 
 
@@ -182,8 +193,6 @@ def test_search_does_not_descend_into_reparse_points(tmp_path, monkeypatch):
 
 
 def test_search_rejects_bad_input(tmp_path):
-    import pytest
-
     with pytest.raises(ValueError):
         search_files(tmp_path, "   ")
     with pytest.raises(ValueError):
@@ -193,3 +202,318 @@ def test_search_rejects_bad_input(tmp_path):
     file_path.write_text("x")
     with pytest.raises(NotADirectoryError):
         search_files(file_path, "x")
+
+
+# --- Drives and file operations --------------------------------------------
+
+
+def test_list_drives_returns_mount_information():
+    drives = list_drives()
+
+    assert isinstance(drives, list)
+    for item in drives:
+        assert item["name"]
+        assert item["path"].exists()
+        assert item["total"] >= 0
+        assert item["free"] >= 0
+        assert 0.0 <= item["percent"] <= 100.0
+
+
+def test_validate_name_accepts_normal_names():
+    assert validate_name("notes.txt") == "notes.txt"
+    assert validate_name("  My Folder  ") == "My Folder"
+    # Surrounding whitespace is trimmed, matching what Explorer accepts.
+    assert validate_name("report.txt ") == "report.txt"
+    assert validate_name("console.txt") == "console.txt"
+    assert validate_name("COM10.log") == "COM10.log"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "",
+        "   ",
+        ".",
+        "..",
+        "bad/name",
+        "bad\\name",
+        'bad:name',
+        "bad?name",
+        "trailing.",
+        "CON",
+        "con.txt",
+        "LPT1",
+        "x" * 151,
+    ],
+)
+def test_validate_name_rejects_bad_names(name):
+    with pytest.raises(ValueError):
+        validate_name(name)
+
+
+def test_make_directory_creates_folder_and_refuses_duplicates(tmp_path):
+    created = make_directory(tmp_path, "New Folder")
+
+    assert created == tmp_path / "New Folder"
+    assert created.is_dir()
+
+    with pytest.raises(FileExistsError):
+        make_directory(tmp_path, "New Folder")
+
+    file_path = tmp_path / "not-a-folder.txt"
+    file_path.write_text("x")
+    with pytest.raises(NotADirectoryError):
+        make_directory(file_path, "child")
+
+
+def test_make_directory_refuses_protected_folder(tmp_path, monkeypatch):
+    protected = tmp_path / "Windows"
+    protected.mkdir()
+    monkeypatch.setattr(file_manager, "_critical_roots", lambda: [protected])
+
+    with pytest.raises(PermissionError):
+        make_directory(protected, "new")
+
+
+def test_drive_root_is_protected():
+    from pathlib import Path
+
+    assert "Drive roots" in file_manager._modify_problem(Path("C:\\"))
+
+
+def test_rename_path_moves_file_and_refuses_overwrite(tmp_path):
+    source = tmp_path / "old.txt"
+    source.write_text("content")
+
+    target = rename_path(source, "new.txt")
+    assert target == tmp_path / "new.txt"
+    assert target.read_text() == "content"
+    assert not source.exists()
+
+    other = tmp_path / "other.txt"
+    other.write_text("x")
+    with pytest.raises(FileExistsError):
+        rename_path(target, "other.txt")
+
+    with pytest.raises(FileNotFoundError):
+        rename_path(tmp_path / "missing.txt", "x.txt")
+
+
+def test_rename_path_refuses_invalid_and_protected(tmp_path, monkeypatch):
+    source = tmp_path / "old.txt"
+    source.write_text("x")
+
+    with pytest.raises(ValueError):
+        rename_path(source, "bad/name")
+
+    protected = tmp_path / "Windows"
+    protected.mkdir()
+    inside = protected / "file.txt"
+    inside.write_text("x")
+    monkeypatch.setattr(file_manager, "_critical_roots", lambda: [protected])
+
+    with pytest.raises(PermissionError):
+        rename_path(inside, "renamed.txt")
+
+
+def test_copy_path_copies_file_and_folder(tmp_path):
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "a.txt").write_text("a")
+    (source / "nested").mkdir()
+    (source / "nested" / "b.txt").write_text("b")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+
+    file_target = copy_path(source / "a.txt", dest)
+    assert file_target.read_text() == "a"
+
+    folder_target = copy_path(source, dest)
+    assert (folder_target / "a.txt").read_text() == "a"
+    assert (folder_target / "nested" / "b.txt").read_text() == "b"
+    assert source.exists()
+
+    with pytest.raises(FileExistsError):
+        copy_path(source / "a.txt", dest)
+
+
+def test_copy_path_refuses_folder_into_itself(tmp_path):
+    source = tmp_path / "src"
+    source.mkdir()
+    nested = source / "nested"
+    nested.mkdir()
+
+    with pytest.raises(ValueError):
+        copy_path(source, nested)
+
+
+def test_copy_path_allows_protected_source_but_not_destination(
+    tmp_path, monkeypatch
+):
+    protected = tmp_path / "Windows"
+    protected.mkdir()
+    source = protected / "file.txt"
+    source.write_text("x")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    monkeypatch.setattr(file_manager, "_critical_roots", lambda: [protected])
+
+    copied = copy_path(source, dest)
+    assert copied.read_text() == "x"
+
+    with pytest.raises(PermissionError):
+        copy_path(source, protected)
+
+
+def test_copy_tree_skips_reparse_points(tmp_path, monkeypatch):
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "real.txt").write_text("real")
+    linked = source / "linked"
+    linked.mkdir()
+    (linked / "secret.txt").write_text("secret")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+
+    original = file_manager._is_reparse_point
+    monkeypatch.setattr(
+        file_manager,
+        "_is_reparse_point",
+        lambda entry: entry.name == "linked" or original(entry),
+    )
+
+    target = copy_path(source, dest)
+
+    assert (target / "real.txt").read_text() == "real"
+    assert not (target / "linked").exists()
+
+
+def test_copy_path_refuses_reparse_source(tmp_path, monkeypatch):
+    source = tmp_path / "linked"
+    source.mkdir()
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    monkeypatch.setattr(file_manager, "_is_reparse_path", lambda path: True)
+
+    with pytest.raises(PermissionError):
+        copy_path(source, dest)
+
+
+def test_move_path_moves_file_and_folder(tmp_path):
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "a.txt").write_text("a")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+
+    moved_file = move_path(source / "a.txt", dest)
+    assert moved_file.read_text() == "a"
+    assert not (source / "a.txt").exists()
+
+    (source / "b.txt").write_text("b")
+    moved_folder = move_path(source, dest)
+    assert (moved_folder / "b.txt").read_text() == "b"
+    assert not source.exists()
+
+
+def test_move_path_refuses_protected_source(tmp_path, monkeypatch):
+    protected = tmp_path / "Windows"
+    protected.mkdir()
+    source = protected / "file.txt"
+    source.write_text("x")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    monkeypatch.setattr(file_manager, "_critical_roots", lambda: [protected])
+
+    with pytest.raises(PermissionError):
+        move_path(source, dest)
+
+
+def test_move_path_cross_drive_copies_then_deletes(tmp_path, monkeypatch):
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "a.txt").write_text("a")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    monkeypatch.setattr(file_manager, "_same_drive", lambda *args: False)
+
+    moved = move_path(source, dest)
+
+    assert (moved / "a.txt").read_text() == "a"
+    assert not source.exists()
+
+
+def test_move_path_cross_drive_reports_partial_delete(tmp_path, monkeypatch):
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "a.txt").write_text("a")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    monkeypatch.setattr(file_manager, "_same_drive", lambda *args: False)
+    monkeypatch.setattr(
+        file_manager,
+        "delete_path",
+        lambda path: {"deleted": 0, "bytes": 0, "errors": 1, "skipped": 0},
+    )
+
+    with pytest.raises(OSError):
+        move_path(source, dest)
+    assert (dest / "src" / "a.txt").read_text() == "a"
+
+
+def test_delete_path_removes_file_and_tree(tmp_path):
+    file_path = tmp_path / "file.txt"
+    file_path.write_text("hello")
+    stats = delete_path(file_path)
+    assert not file_path.exists()
+    assert stats["deleted"] == 1
+    assert stats["bytes"] == 5
+
+    folder = tmp_path / "folder"
+    (folder / "nested").mkdir(parents=True)
+    (folder / "a.txt").write_text("a")
+    (folder / "nested" / "b.txt").write_text("bb")
+
+    stats = delete_path(folder)
+    assert not folder.exists()
+    assert stats["deleted"] == 4
+    assert stats["errors"] == 0
+
+
+def test_delete_path_refuses_protected_and_missing(tmp_path, monkeypatch):
+    protected = tmp_path / "Windows"
+    protected.mkdir()
+    source = protected / "file.txt"
+    source.write_text("x")
+    monkeypatch.setattr(file_manager, "_critical_roots", lambda: [protected])
+
+    with pytest.raises(PermissionError):
+        delete_path(source)
+
+    with pytest.raises(FileNotFoundError):
+        delete_path(tmp_path / "missing.txt")
+
+
+def test_delete_path_does_not_follow_junctions(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "secret.txt").write_text("secret")
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "keep.txt").write_text("x")
+    link = root / "linked"
+    try:
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        pytest.skip("cannot create a junction on this system")
+
+    stats = delete_path(root)
+
+    assert not root.exists()
+    assert stats["deleted"] == 3
+    assert stats["errors"] == 0
+    assert (target / "secret.txt").read_text() == "secret"
