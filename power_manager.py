@@ -10,6 +10,7 @@ Security:
 """
 
 import logging
+import os
 import subprocess
 import time
 from typing import Any, Dict, Optional, Tuple
@@ -70,6 +71,64 @@ def sleep_system() -> Tuple[bool, str]:
     except Exception as e:
         logger.error(f"Error initiating sleep: {e}")
         return False, f"Error initiating sleep: {str(e)}"
+
+
+def hibernate_system() -> Tuple[bool, str]:
+    """Hibernate the system, preserving the running session on disk.
+
+    Uses ``shutdown /h``. Hibernation must be enabled in Windows power
+    settings; when it is disabled Windows rejects the request.
+
+    Returns:
+        Tuple of (success, message).
+    """
+    try:
+        result = subprocess.run(
+            ["shutdown", "/h"],
+            capture_output=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return True, "Hibernation initiated."
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        return False, f"Failed to hibernate: {stderr or 'hibernation is disabled'}"
+    except subprocess.TimeoutExpired:
+        return False, "Command timed out while hibernating."
+    except Exception as e:
+        logger.error(f"Error hibernating: {e}")
+        return False, f"Error hibernating: {str(e)}"
+
+
+def _send_monitor_power(flag: int) -> None:
+    """Send the SC_MONITORPOWER system command to every top-level window.
+
+    ``flag`` 2 turns the display off, -1 restores it. Kept as a module-level
+    helper so tests can monkeypatch it and never blank a real screen.
+    """
+    import ctypes
+
+    HWND_BROADCAST = 0xFFFF
+    WM_SYSCOMMAND = 0x0112
+    SC_MONITORPOWER = 0xF170
+    ctypes.windll.user32.SendMessageW(
+        HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, int(flag)
+    )
+
+
+def display_off() -> Tuple[bool, str]:
+    """Turn the monitor off without locking or sleeping the PC.
+
+    Returns:
+        Tuple of (success, message).
+    """
+    if os.name != "nt":
+        return False, "Display control is only available on Windows."
+    try:
+        _send_monitor_power(2)
+        return True, "Display turned off. Move the mouse or press a key to wake it."
+    except Exception as e:
+        logger.error(f"Error turning display off: {e}")
+        return False, f"Error turning display off: {str(e)}"
 
 
 def cancel_shutdown() -> Tuple[bool, str]:
@@ -220,6 +279,8 @@ def get_power_status() -> Dict[str, Any]:
     return {
         "can_lock": True,
         "can_sleep": True,
+        "can_hibernate": True,
+        "can_display_off": os.name == "nt",
         # Cannot be queried safely; assume unknown
         "has_pending_shutdown": False,
         "shutdown_description": "Complete power off (30s delay, cancellable)",

@@ -37,6 +37,7 @@ from file_manager import (
     format_size,
     list_directory,
     save_upload,
+    search_files,
 )
 from media_control import MEDIA_ACTIONS, press_key
 from network_info import collect_network_status
@@ -45,11 +46,15 @@ from scheduler import TaskScheduler, describe_task
 logger = logging.getLogger(__name__)
 
 FILES_PER_PAGE = 8
+SEARCH_PER_PAGE = 8
+SEARCH_TTL_SECONDS = 300
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 CLEAN_CONFIRM_KEY = "disk_clean"
 RECYCLE_CONFIRM_KEY = "recycle_bin"
 
 _FILE_STATE: Dict[int, Dict[str, Any]] = {}
+_SEARCH_STATE: Dict[int, Dict[str, Any]] = {}
+_SEARCH_PENDING: Dict[int, Dict[str, Any]] = {}
 _scheduler: Optional[TaskScheduler] = None
 
 
@@ -301,6 +306,9 @@ async def confirm_empty_bin(message: types.Message) -> None:
 
 async def show_files(message: types.Message, path: Optional[Path] = None) -> None:
     """Open the file browser at ``path`` (home folder by default)."""
+    chat_id = _key(message)
+    cancel_search_pending(chat_id)
+    _SEARCH_STATE.pop(chat_id, None)
     await _load_directory(message, Path(path) if path else Path.home())
 
 
@@ -376,6 +384,7 @@ async def _render_files(message: types.Message) -> None:
         _button("Up", "fm_up"),
         _button("Refresh", "fm_refresh"),
     ]
+    rows.append([_button("Search this folder", "fm_search")])
     rows.append(nav)
     rows.append([_button("<< Back", "menu_main")])
 
@@ -414,6 +423,163 @@ def _parse_index(data: str, prefix: str) -> Optional[int]:
     return int(raw)
 
 
+# --- File search -----------------------------------------------------------
+
+
+def cancel_search_pending(chat_id: int) -> None:
+    """Cancel an armed search prompt for this chat."""
+    _SEARCH_PENDING.pop(int(chat_id), None)
+
+
+def _prune_search_pending() -> None:
+    """Drop expired search prompts."""
+    now = time.time()
+    for key, entry in list(_SEARCH_PENDING.items()):
+        if float(entry.get("expiry", 0)) < now:
+            _SEARCH_PENDING.pop(key, None)
+
+
+async def _start_search_prompt(
+    message: types.Message, root: Path, note: str = ""
+) -> None:
+    """Arm a one-shot prompt: the next text message is a search query."""
+    chat_id = _key(message)
+    _prune_search_pending()
+    _SEARCH_PENDING[chat_id] = {
+        "root": str(root),
+        "expiry": time.time() + SEARCH_TTL_SECONDS,
+    }
+
+    lines = ["=== SEARCH FILES ===", ""]
+    if note:
+        lines += [note, ""]
+    lines += [
+        f"Folder: {root}",
+        "",
+        "Send a file name fragment to find matching files and folders.",
+        "Wildcards work too: *.mp4, setup?.",
+        "Searches up to 4 levels below this folder, with a time limit.",
+        "",
+        f"This prompt expires in {SEARCH_TTL_SECONDS // 60} min.",
+    ]
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=types.InlineKeyboardMarkup(
+            inline_keyboard=[[_button("Cancel", "fm_search_cancel")]]
+        ),
+        disable_web_page_preview=True,
+    )
+
+
+async def _render_search(message: types.Message) -> None:
+    """Render cached search results with paging and navigation."""
+    state = _SEARCH_STATE.get(_key(message))
+    if state is None:
+        await message.answer("Search results expired. Open Files and search again.")
+        return
+
+    results: List[Dict[str, Any]] = state["results"]
+    page_count = max(1, (len(results) + SEARCH_PER_PAGE - 1) // SEARCH_PER_PAGE)
+    page = min(max(0, int(state["page"])), page_count - 1)
+    state["page"] = page
+    start = page * SEARCH_PER_PAGE
+    visible = results[start:start + SEARCH_PER_PAGE]
+
+    lines = [f"=== SEARCH: {state['query']} ===", f"Folder: {state['root']}", ""]
+    if not results:
+        lines.append("No matching files or folders.")
+    else:
+        suffix = " (stopped early)" if state.get("truncated") else ""
+        lines.append(
+            f"Matches: {len(results)}{suffix} | Page {page + 1}/{page_count}"
+        )
+    if state.get("truncated"):
+        lines.append(
+            f"Scanned {state.get('scanned_dirs', 0)} folders before the "
+            "limit; narrow the query for fewer results."
+        )
+
+    rows: List[List[types.InlineKeyboardButton]] = []
+    for offset, entry in enumerate(visible):
+        index = start + offset
+        name = str(entry["name"])
+        if entry["is_dir"]:
+            label = f"[DIR] {name}"
+        else:
+            label = f"[FILE] {name} ({format_size(entry['size'])})"
+        if len(label) > 55:
+            label = label[:52] + "..."
+        rows.append([_button(label, f"fm_hit_{index}")])
+
+    if page > 0:
+        rows.append([_button("< Prev", f"fm_spage_{page - 1}")])
+    if page < page_count - 1:
+        rows.append([_button("Next >", f"fm_spage_{page + 1}")])
+
+    rows.append([_button("Search again", "fm_search")])
+    rows.append([_button("Back to folder", "fm_back")])
+    rows.append([_button("<< Main menu", "menu_main")])
+
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=rows),
+        disable_web_page_preview=True,
+    )
+
+
+async def handle_text(message: types.Message, state: Any = None) -> bool:
+    """Run a search for the next plain-text message when a prompt is armed.
+
+    Returns ``True`` when the message belonged to a search prompt.
+    """
+    from security import is_user_authorized
+
+    user = getattr(message, "from_user", None)
+    if user is not None and not is_user_authorized(user.id):
+        return False
+
+    chat_id = _key(message)
+    _prune_search_pending()
+    entry = _SEARCH_PENDING.get(chat_id)
+    if entry is None:
+        return False
+
+    text = str(getattr(message, "text", "") or "").strip()
+    if not text:
+        entry["expiry"] = time.time() + SEARCH_TTL_SECONDS
+        _SEARCH_PENDING[chat_id] = entry
+        await message.answer(
+            "Search text is empty. Send a file name fragment or press Cancel.",
+            reply_markup=types.InlineKeyboardMarkup(
+                inline_keyboard=[[_button("Cancel", "fm_search_cancel")]]
+            ),
+        )
+        return True
+
+    _SEARCH_PENDING.pop(chat_id, None)
+    root = Path(str(entry.get("root") or Path.home()))
+    try:
+        found = await asyncio.to_thread(search_files, root, text)
+    except ValueError as e:
+        await message.answer(f"Search failed: {e}")
+        return True
+    except Exception:
+        logger.exception("File search failed")
+        await message.answer("Search failed: unexpected error.")
+        return True
+
+    _SEARCH_STATE[chat_id] = {
+        "root": found["root"],
+        "query": found["query"],
+        "results": found["results"],
+        "truncated": found["truncated"],
+        "scanned_dirs": found["scanned_dirs"],
+        "page": 0,
+    }
+    await _render_search(message)
+    return True
+
+
 async def _handle_file_callback(callback: types.CallbackQuery, data: str) -> None:
     """Route fm_* callbacks using the per-chat cached listing."""
     message = callback.message
@@ -426,6 +592,72 @@ async def _handle_file_callback(callback: types.CallbackQuery, data: str) -> Non
         return
     if data == "fm_noop":
         await callback.answer()
+        return
+
+    search_state = _SEARCH_STATE.get(_key(message))
+
+    if data == "fm_search":
+        file_state = _FILE_STATE.get(_key(message))
+        if file_state is not None:
+            root = Path(file_state["path"])
+        elif search_state is not None:
+            root = Path(search_state["root"])
+        else:
+            await callback.answer("File browser expired", show_alert=True)
+            await show_files(message)
+            return
+        await _start_search_prompt(message, root)
+        return
+
+    if data == "fm_search_cancel":
+        chat_id = _key(message)
+        cancel_search_pending(chat_id)
+        await callback.answer("Search cancelled")
+        file_state = _FILE_STATE.get(chat_id)
+        if file_state is not None:
+            await _load_directory(message, Path(file_state["path"]))
+        else:
+            await show_files(message)
+        return
+
+    if data == "fm_back":
+        cancel_search_pending(_key(message))
+        if search_state is not None:
+            await _load_directory(message, Path(search_state["root"]))
+            return
+        file_state = _FILE_STATE.get(_key(message))
+        if file_state is not None:
+            await _load_directory(message, Path(file_state["path"]))
+        else:
+            await show_files(message)
+        return
+
+    if data.startswith("fm_spage_"):
+        page = _parse_index(data, "fm_spage_")
+        if search_state is None:
+            await callback.answer("Search results expired", show_alert=True)
+            return
+        if page is None:
+            await callback.answer("Invalid page", show_alert=True)
+            return
+        search_state["page"] = page
+        await _render_search(message)
+        return
+
+    if data.startswith("fm_hit_"):
+        index = _parse_index(data, "fm_hit_")
+        if search_state is None:
+            await callback.answer("Search results expired", show_alert=True)
+            return
+        hits: List[Dict[str, Any]] = search_state["results"]
+        if index is None or not 0 <= index < len(hits):
+            await callback.answer("Result is gone; search again", show_alert=True)
+            return
+        entry = hits[index]
+        if entry["is_dir"]:
+            await _load_directory(message, Path(entry["path"]))
+        else:
+            await _send_file(message, entry)
         return
 
     state = _FILE_STATE.get(_key(message))

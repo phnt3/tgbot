@@ -79,6 +79,18 @@ def register_init_callbacks(dispatcher: Dispatcher) -> None:
             await callback.answer("Invalid callback data", show_alert=True)
             return
 
+        # A button press means the user moved on: cancel armed one-shot text
+        # prompts so the next message is not swallowed by a stale prompt.
+        from handlers import clipboard_ui, features
+
+        chat = getattr(callback.message, "chat", None)
+        chat_id = int(getattr(chat, "id", 0) or 0)
+        if chat_id:
+            if data not in ("clip_write", "clip_open", "clip_cancel"):
+                clipboard_ui.cancel_pending(chat_id)
+            if data not in ("fm_search", "fm_search_cancel"):
+                features.cancel_search_pending(chat_id)
+
         # Per-application launch buttons use index-based callback data
         # (app_<idx>), keeping 64-byte limits and injection concerns away
         if data.startswith("app_") and data[4:].isdigit():
@@ -98,6 +110,9 @@ def register_init_callbacks(dispatcher: Dispatcher) -> None:
             from handlers import features
 
             await features.handle_callback(callback, data)
+        elif data.startswith("clip_"):
+            # Clipboard bridge lives in handlers/clipboard_ui.py
+            await clipboard_ui.handle_callback(callback, data)
         elif data.startswith("set_"):
             # In-bot settings screens live in handlers/settings_ui.py
             from handlers import settings_ui
@@ -123,6 +138,7 @@ def register_init_callbacks(dispatcher: Dispatcher) -> None:
                 "menu_media": lambda msg: features.show_media_menu(msg),
                 "menu_network": lambda msg: features.show_network(msg),
                 "menu_scheduler": lambda msg: features.show_scheduler(msg),
+                "menu_clipboard": lambda msg: clipboard_ui.show_clipboard(msg),
                 "profile_gaming": lambda msg: launch_profile_callback(msg, "GAMING"),
                 "profile_vr": lambda msg: launch_profile_callback(msg, "VR"),
                 "profile_work": lambda msg: launch_profile_callback(msg, "WORK"),
@@ -417,10 +433,14 @@ async def show_power_management(message: types.Message) -> None:
     lines = ["=== POWER MANAGEMENT ===", ""]
     lines.append("Lock workstation: available")
     lines.append("Sleep: available")
+    lines.append(f"Hibernate: {'available' if status.get('can_hibernate') else 'unavailable'}")
+    lines.append(f"Display off: {'available' if status.get('can_display_off') else 'unavailable'}")
     lines.append(f"Shutdown: {'pending' if status.get('has_pending_shutdown') else 'available'}")
     lines.append("Restart: available")
     lines.append("Cancel shutdown: available")
     lines.append("")
+    lines.append("Hibernate saves the session to disk; nothing is lost.")
+    lines.append("Display off only blanks the monitor, the PC keeps running.")
     lines.append("Restart and Shutdown require a second Confirm press.")
     lines.append("After confirmation Windows waits 30 seconds,")
     lines.append("and Cancel Shutdown aborts it during that window.")
@@ -428,6 +448,8 @@ async def show_power_management(message: types.Message) -> None:
     keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
         [types.InlineKeyboardButton(text="Lock", callback_data="action_lock")],
         [types.InlineKeyboardButton(text="Sleep", callback_data="action_sleep")],
+        [types.InlineKeyboardButton(text="Hibernate", callback_data="action_hibernate")],
+        [types.InlineKeyboardButton(text="Display Off", callback_data="action_display_off")],
         [types.InlineKeyboardButton(text="Restart", callback_data="action_restart")],
         [types.InlineKeyboardButton(text="Shutdown", callback_data="action_shutdown")],
         [types.InlineKeyboardButton(text="Cancel Shutdown", callback_data="action_cancel")],
@@ -452,15 +474,31 @@ async def handle_power_action(callback: types.CallbackQuery, data: str) -> None:
     one-shot confirmation: nothing happens until the user presses Confirm
     within 60 seconds.
     """
-    from power_manager import cancel_shutdown, lock_workstation, sleep_system
+    from power_manager import (
+        cancel_shutdown,
+        display_off,
+        hibernate_system,
+        lock_workstation,
+        sleep_system,
+    )
 
     message = callback.message
 
-    if data in ("action_lock", "action_sleep", "action_cancel"):
+    if data in (
+        "action_lock",
+        "action_sleep",
+        "action_hibernate",
+        "action_display_off",
+        "action_cancel",
+    ):
         if data == "action_lock":
             operation, label = lock_workstation, "Lock"
         elif data == "action_sleep":
             operation, label = sleep_system, "Sleep"
+        elif data == "action_hibernate":
+            operation, label = hibernate_system, "Hibernate"
+        elif data == "action_display_off":
+            operation, label = display_off, "Display off"
         else:
             operation, label = cancel_shutdown, "Cancel shutdown"
             _clear_confirmations("restart", "shutdown")

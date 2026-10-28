@@ -101,6 +101,12 @@ async def show_main_menu(message: types.Message) -> None:
         ],
         [
             types.InlineKeyboardButton(
+                text="Clipboard",
+                callback_data="menu_clipboard"
+            ),
+        ],
+        [
+            types.InlineKeyboardButton(
                 text="Settings",
                 callback_data="menu_settings"
             ),
@@ -128,16 +134,17 @@ async def show_help(message: types.Message) -> None:
         "- System Monitoring: CPU, RAM, GPU, disk metrics\n"
         "- Launch Applications: open configured applications\n"
         "- Gaming Mode: launch gaming profiles\n"
-        "- Power Management: lock, sleep, shutdown, restart\n"
+        "- Power Management: lock, sleep, hibernate, display off, shutdown, restart\n"
         "- Screenshot: take a desktop screenshot on demand\n"
         "- Running Processes: view top processes\n"
         "- Alerts & History: view alerts and monitoring history\n"
         "- Charts: CPU/GPU/RAM/disk history graphs (5m, 1h, 24h)\n"
-        "- Files: browse folders, download files, and upload files to the PC\n"
+        "- Files: browse folders, download files, search recursively, upload files to the PC\n"
         "- Disk Space: disk usage, temp/cache analysis and cleanup\n"
         "- Media & Volume: volume, mute and media transport keys\n"
         "- Network / VPN: active interfaces, Wi-Fi and VPN status\n"
         "- Scheduled Tasks: timed shutdown, restart, sleep, lock or profile launch\n"
+        "- Clipboard: read, replace or clear the Windows clipboard text\n"
         "- Settings: change notifications, alerts, applications, profiles and backups\n\n"
         "Send a document or photo to the bot to save it in data/uploads.\n"
         "A settings backup is imported only from Settings -> Backup & restore.\n"

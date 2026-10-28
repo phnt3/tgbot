@@ -141,6 +141,58 @@ def test_lock_runs_immediately(monkeypatch):
     assert "Lock: OK" in callback.message.sent[-1]["text"]
 
 
+def test_hibernate_runs_immediately(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        power_manager, "hibernate_system",
+        lambda: calls.append(True) or (True, "hibernating"),
+    )
+    monkeypatch.setattr(
+        power_manager, "lock_workstation",
+        lambda: pytest.fail("lock must not run for hibernate"),
+    )
+
+    callback = FakeCallback()
+    asyncio.run(handlers.handle_power_action(callback, "action_hibernate"))
+    assert calls == [True]
+    assert "Hibernate: OK" in callback.message.sent[-1]["text"]
+
+
+def test_display_off_runs_immediately(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        power_manager, "display_off",
+        lambda: calls.append(True) or (True, "monitor off"),
+    )
+
+    callback = FakeCallback()
+    asyncio.run(handlers.handle_power_action(callback, "action_display_off"))
+    assert calls == [True]
+    assert "Display off: OK" in callback.message.sent[-1]["text"]
+
+
+def test_power_screen_shows_new_actions(monkeypatch):
+    monkeypatch.setattr(
+        power_manager,
+        "get_power_status",
+        lambda: {
+            "can_hibernate": True,
+            "can_display_off": True,
+            "has_pending_shutdown": False,
+        },
+    )
+    message = FakeCallback().message
+
+    asyncio.run(handlers.show_power_management(message))
+
+    body = message.sent[-1]["text"]
+    assert "Hibernate: available" in body
+    assert "Display off: available" in body
+    datas = button_datas(message.sent[-1]["reply_markup"])
+    assert "action_hibernate" in datas
+    assert "action_display_off" in datas
+
+
 def test_cancel_shutdown_clears_pending_confirmations(monkeypatch):
     calls = []
     monkeypatch.setattr(

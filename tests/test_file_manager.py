@@ -11,6 +11,7 @@ from file_manager import (
     read_for_send,
     sanitize_filename,
     save_upload,
+    search_files,
 )
 
 
@@ -91,3 +92,104 @@ def test_default_upload_dir_uses_data_dir():
 
     expected = config.config["DATA_DIR"] / "uploads"
     assert file_manager.default_upload_dir() == expected
+
+
+# --- Recursive search ------------------------------------------------------
+
+
+def test_search_finds_substring_case_insensitively(tmp_path):
+    (tmp_path / "Movies").mkdir()
+    (tmp_path / "Movies" / "Holiday_Clip.MP4").write_bytes(b"x")
+    (tmp_path / "notes.txt").write_text("x")
+
+    found = search_files(tmp_path, "holiday")
+
+    assert [item["name"] for item in found["results"]] == ["Holiday_Clip.MP4"]
+    assert found["results"][0]["is_dir"] is False
+    assert found["results"][0]["size"] == 1
+    assert found["truncated"] is False
+
+
+def test_search_matches_folders_and_wildcards(tmp_path):
+    (tmp_path / "alpha").mkdir()
+    (tmp_path / "beta").mkdir()
+    (tmp_path / "clip1.mp4").write_bytes(b"123")
+    (tmp_path / "clip2.txt").write_text("x")
+
+    folders = search_files(tmp_path, "ALP")
+    files = search_files(tmp_path, "*.mp4")
+
+    assert [item["name"] for item in folders["results"]] == ["alpha"]
+    assert folders["results"][0]["is_dir"] is True
+    assert [item["name"] for item in files["results"]] == ["clip1.mp4"]
+
+
+def test_search_respects_depth_limit(tmp_path):
+    (tmp_path / "top.txt").write_text("x")
+    (tmp_path / "one").mkdir()
+    (tmp_path / "one" / "mid.txt").write_text("x")
+    (tmp_path / "one" / "two").mkdir()
+    (tmp_path / "one" / "two" / "deep.txt").write_text("x")
+
+    shallow = search_files(tmp_path, "txt", max_depth=0)
+    one_level = search_files(tmp_path, "txt", max_depth=1)
+    deep = search_files(tmp_path, "txt", max_depth=2)
+
+    assert [item["name"] for item in shallow["results"]] == ["top.txt"]
+    assert {item["name"] for item in one_level["results"]} == {
+        "top.txt",
+        "mid.txt",
+    }
+    assert {item["name"] for item in deep["results"]} == {
+        "top.txt",
+        "mid.txt",
+        "deep.txt",
+    }
+
+
+def test_search_stops_at_result_limit(tmp_path):
+    for index in range(10):
+        (tmp_path / f"match{index}.txt").write_text("x")
+
+    found = search_files(tmp_path, "match", max_results=3)
+
+    assert len(found["results"]) == 3
+    assert found["truncated"] is True
+
+
+def test_search_stops_at_directory_limit(tmp_path):
+    for index in range(5):
+        (tmp_path / f"dir{index}").mkdir()
+    (tmp_path / "dir0" / "target.txt").write_text("x")
+
+    found = search_files(tmp_path, "target", max_dirs=1)
+
+    assert found["results"] == []
+    assert found["scanned_dirs"] == 1
+    assert found["truncated"] is True
+
+
+def test_search_does_not_descend_into_reparse_points(tmp_path, monkeypatch):
+    nested = tmp_path / "linked"
+    nested.mkdir()
+    (nested / "hidden_target.txt").write_text("x")
+
+    monkeypatch.setattr(file_manager, "_is_reparse_point", lambda entry: True)
+
+    found = search_files(tmp_path, "hidden_target")
+
+    assert found["results"] == []
+
+
+def test_search_rejects_bad_input(tmp_path):
+    import pytest
+
+    with pytest.raises(ValueError):
+        search_files(tmp_path, "   ")
+    with pytest.raises(ValueError):
+        search_files(tmp_path, "x" * 121)
+
+    file_path = tmp_path / "file.txt"
+    file_path.write_text("x")
+    with pytest.raises(NotADirectoryError):
+        search_files(file_path, "x")

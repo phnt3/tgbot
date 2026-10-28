@@ -146,6 +146,150 @@ def test_file_browser_reports_unreadable_path(tmp_path):
     assert "Cannot open folder" in texts(message)[0]
 
 
+# --- File search -----------------------------------------------------------
+
+
+def _authorize(monkeypatch):
+    import security
+
+    monkeypatch.setattr(security, "is_user_authorized", lambda user_id: True)
+
+
+def test_search_prompt_and_results(tmp_path, monkeypatch):
+    _authorize(monkeypatch)
+    (tmp_path / "videos").mkdir()
+    (tmp_path / "movie_clip.mp4").write_bytes(b"x")
+    message = FakeMessage()
+    run(features.show_files(message, tmp_path))
+
+    callback = FakeCallback()
+    run(features._handle_file_callback(callback, "fm_search"))
+
+    prompt = texts(callback.message)[-1]
+    assert "=== SEARCH FILES ===" in prompt
+    assert f"Folder: {tmp_path}" in prompt
+    assert button_datas(callback.message.sent[-1]["reply_markup"]) == [
+        "fm_search_cancel"
+    ]
+    assert features._SEARCH_PENDING
+
+    message.text = "movie_*"
+    assert run(features.handle_text(message)) is True
+
+    body = texts(message)[-1]
+    assert "=== SEARCH: movie_* ===" in body
+    assert "Matches: 1" in body
+    datas = button_datas(message.sent[-1]["reply_markup"])
+    labels = [
+        row[0].text
+        for row in message.sent[-1]["reply_markup"].inline_keyboard
+        if row
+    ]
+    assert any("movie_clip.mp4" in label for label in labels)
+    assert "fm_hit_0" in datas
+    assert {"fm_search", "fm_back"}.issubset(datas)
+    assert features._SEARCH_PENDING == {}
+
+
+def test_search_result_opens_folder_and_sends_file(tmp_path, monkeypatch):
+    _authorize(monkeypatch)
+    (tmp_path / "target_dir").mkdir()
+    (tmp_path / "target.txt").write_text("hello")
+    message = FakeMessage()
+    run(features.show_files(message, tmp_path))
+
+    run(features._handle_file_callback(FakeCallback(), "fm_search"))
+    message.text = "target_dir"
+    run(features.handle_text(message))
+    callback = FakeCallback()
+    run(features._handle_file_callback(callback, "fm_hit_0"))
+    assert f"=== FILES: {tmp_path / 'target_dir'} ===" in texts(callback.message)[-1]
+
+    run(features._handle_file_callback(FakeCallback(), "fm_back"))
+    run(features._handle_file_callback(FakeCallback(), "fm_search"))
+    message.text = "target.txt"
+    run(features.handle_text(message))
+    callback = FakeCallback()
+    run(features._handle_file_callback(callback, "fm_hit_0"))
+    sent = callback.message.sent[-1]
+    assert sent["text"] == "target.txt"
+    assert sent["document"].path == str(tmp_path / "target.txt")
+
+
+def test_search_results_page(tmp_path, monkeypatch):
+    _authorize(monkeypatch)
+    for index in range(10):
+        (tmp_path / f"match{index:02d}.txt").write_text("x")
+    message = FakeMessage()
+    run(features.show_files(message, tmp_path))
+
+    run(features._handle_file_callback(FakeCallback(), "fm_search"))
+    message.text = "match"
+    run(features.handle_text(message))
+    assert "Page 1/2" in texts(message)[-1]
+    assert "fm_spage_1" in button_datas(message.sent[-1]["reply_markup"])
+
+    callback = FakeCallback()
+    run(features._handle_file_callback(callback, "fm_spage_1"))
+    assert "Page 2/2" in texts(callback.message)[-1]
+    assert "fm_spage_0" in button_datas(callback.message.sent[-1]["reply_markup"])
+
+
+def test_search_empty_text_keeps_prompt(tmp_path, monkeypatch):
+    _authorize(monkeypatch)
+    message = FakeMessage()
+    run(features.show_files(message, tmp_path))
+    run(features._handle_file_callback(FakeCallback(), "fm_search"))
+
+    message.text = "   "
+    assert run(features.handle_text(message)) is True
+
+    assert "Search text is empty" in texts(message)[-1]
+    assert features._SEARCH_PENDING
+
+
+def test_search_expired_prompt_is_ignored(tmp_path, monkeypatch):
+    _authorize(monkeypatch)
+    message = FakeMessage()
+    run(features.show_files(message, tmp_path))
+    run(features._handle_file_callback(FakeCallback(), "fm_search"))
+    features._SEARCH_PENDING[message.chat.id]["expiry"] = 0.0
+
+    message.text = "anything"
+    assert run(features.handle_text(message)) is False
+    assert features._SEARCH_PENDING == {}
+
+
+def test_search_cancel_clears_prompt_and_returns_to_folder(tmp_path, monkeypatch):
+    _authorize(monkeypatch)
+    message = FakeMessage()
+    run(features.show_files(message, tmp_path))
+    callback = FakeCallback()
+    run(features._handle_file_callback(callback, "fm_search"))
+    assert features._SEARCH_PENDING
+
+    run(features._handle_file_callback(callback, "fm_search_cancel"))
+
+    assert features._SEARCH_PENDING == {}
+    assert callback.answers[-1]["text"] == "Search cancelled"
+    assert f"=== FILES: {tmp_path} ===" in texts(callback.message)[-1]
+
+
+def test_search_failure_is_reported(tmp_path, monkeypatch):
+    _authorize(monkeypatch)
+    message = FakeMessage()
+    run(features.show_files(message, tmp_path))
+    run(features._handle_file_callback(FakeCallback(), "fm_search"))
+    monkeypatch.setattr(
+        features, "search_files", lambda *a, **k: (_ for _ in ()).throw(ValueError("bad"))
+    )
+
+    message.text = "x"
+    assert run(features.handle_text(message)) is True
+
+    assert "Search failed: bad" in texts(message)[-1]
+
+
 # --- Uploads ---------------------------------------------------------------
 
 
@@ -160,12 +304,6 @@ class FakePhoto:
     def __init__(self, file_id="photo1", file_size=4):
         self.file_id = file_id
         self.file_size = file_size
-
-
-def _authorize(monkeypatch):
-    import security
-
-    monkeypatch.setattr(security, "is_user_authorized", lambda user_id: True)
 
 
 def test_upload_saves_document(monkeypatch, tmp_path):

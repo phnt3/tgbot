@@ -108,12 +108,17 @@ async def main() -> None:
         async def upload_handler(message: types.Message) -> None:
             await features.handle_upload(message)
 
-        # Free-text answers to settings prompts. Registered last so commands
-        # and uploads keep priority; harmless when nothing is pending.
-        from handlers import settings_ui
+        # Free-text answers: file search and clipboard prompts first, then
+        # settings prompts. Registered last so commands and uploads keep
+        # priority; harmless when nothing is pending.
+        from handlers import clipboard_ui, settings_ui
 
         @dispatcher.message(F.text & ~F.text.startswith("/"))
-        async def settings_text_handler(message: types.Message) -> None:
+        async def text_handler(message: types.Message) -> None:
+            if await features.handle_text(message):
+                return
+            if await clipboard_ui.handle_text(message):
+                return
             await settings_ui.handle_text(message)
 
         # Periodic sampling: writes history and pushes threshold alerts.

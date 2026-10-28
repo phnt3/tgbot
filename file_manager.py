@@ -6,10 +6,13 @@ downloads are capped to the Telegram Bot API limit, and uploads are written
 into a dedicated folder with sanitized names and no accidental overwrite.
 """
 
+import fnmatch
 import logging
 import os
 import re
+import stat as stat_module
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -76,6 +79,137 @@ def list_directory(path: Path) -> Dict[str, Any]:
     entries.sort(key=lambda item: (not item["is_dir"], item["name"].casefold()))
     parent = directory.parent if directory.parent != directory else None
     return {"path": directory, "parent": parent, "entries": entries}
+
+
+def _is_reparse_point(entry: os.DirEntry) -> bool:
+    """Return True for junctions/symlinks that could create directory loops."""
+    try:
+        attributes = getattr(
+            entry.stat(follow_symlinks=False), "st_file_attributes", 0
+        )
+    except OSError:
+        return False
+    flag = getattr(stat_module, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(attributes & flag)
+
+
+def search_files(
+    root: Path,
+    query: str,
+    max_depth: int = 4,
+    max_dirs: int = 2000,
+    max_results: int = 30,
+    time_budget: float = 8.0,
+) -> Dict[str, Any]:
+    """Search file and folder names below ``root`` with hard limits.
+
+    Matching is case-insensitive substring matching; when ``query`` contains
+    ``*`` or ``?`` it is treated as a shell-style wildcard pattern. Directory
+    junctions and symlinks are never descended into, so a recursive search can
+    not loop forever.
+
+    Args:
+        root: Directory to start from.
+        query: File name fragment or wildcard pattern.
+        max_depth: How many directory levels below ``root`` to visit.
+        max_dirs: Maximum number of directories scanned.
+        max_results: Maximum number of matches returned.
+        time_budget: Soft wall-clock limit in seconds.
+
+    Returns:
+        Dict with keys: root (Path), query (str), results (list of dicts with
+        name, path, is_dir, size), truncated (bool), scanned_dirs (int).
+
+    Raises:
+        NotADirectoryError: If ``root`` is not an existing directory.
+        ValueError: If the query is empty or too long.
+    """
+    directory = Path(root)
+    if not directory.is_dir():
+        raise NotADirectoryError(str(directory))
+
+    term = str(query or "").strip()
+    if not term:
+        raise ValueError("Search text is empty.")
+    if len(term) > 120:
+        raise ValueError("Search text is too long (120 characters max).")
+
+    depth_limit = max(0, int(max_depth))
+    dir_limit = max(1, int(max_dirs))
+    result_limit = max(1, int(max_results))
+    deadline = time.monotonic() + max(0.1, float(time_budget))
+
+    folded = term.casefold()
+    wildcard = "*" in term or "?" in term
+    results: List[Dict[str, Any]] = []
+    scanned = 0
+    truncated = False
+    queue: deque = deque([(directory, 0)])
+
+    while queue:
+        if scanned >= dir_limit or time.monotonic() >= deadline:
+            truncated = True
+            break
+
+        current, depth = queue.popleft()
+        scanned += 1
+        try:
+            with os.scandir(current) as iterator:
+                for entry in iterator:
+                    if time.monotonic() >= deadline:
+                        truncated = True
+                        break
+
+                    try:
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                    except OSError:
+                        continue
+
+                    name = entry.name
+                    matches = (
+                        fnmatch.fnmatch(name.casefold(), folded)
+                        if wildcard
+                        else folded in name.casefold()
+                    )
+                    if matches:
+                        size = 0
+                        if not is_dir:
+                            try:
+                                size = entry.stat(follow_symlinks=False).st_size
+                            except OSError:
+                                size = 0
+                        results.append(
+                            {
+                                "name": name,
+                                "path": Path(entry.path),
+                                "is_dir": is_dir,
+                                "size": size,
+                            }
+                        )
+                        if len(results) >= result_limit:
+                            truncated = True
+                            break
+
+                    if (
+                        is_dir
+                        and depth < depth_limit
+                        and not _is_reparse_point(entry)
+                    ):
+                        queue.append((Path(entry.path), depth + 1))
+        except OSError as e:
+            logger.debug("Cannot search %s: %s", current, e)
+            continue
+
+        if len(results) >= result_limit or truncated:
+            break
+
+    return {
+        "root": directory,
+        "query": term,
+        "results": results,
+        "truncated": truncated,
+        "scanned_dirs": scanned,
+    }
 
 
 def read_for_send(path: Path) -> Tuple[bytes, str]:
